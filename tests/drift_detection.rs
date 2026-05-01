@@ -919,9 +919,9 @@ fn risk_params_encode_wire_produces_correct_byte_count() {
     );
 }
 
-/// read_risk_params requires all 3 trailing fields. Truncated payloads are rejected.
+/// read_risk_params requires both trailing u128 dust floors. Truncated payloads are rejected.
 #[test]
-fn risk_params_three_trailing_fields_are_mandatory() {
+fn risk_params_two_trailing_fields_are_mandatory() {
     let mut data = vec![TAG_INIT_MARKET];
     // Fixed header fields before RiskParams:
     data.extend_from_slice(&[0u8; 32]); // admin
@@ -934,18 +934,78 @@ fn risk_params_three_trailing_fields_are_mandatory() {
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     // maintenance_fee_per_slot removed in v12.15
 
-    // Append risk params body but omit the last 3 fields (48 bytes)
+    // Append risk params body but omit the two trailing dust-floor fields (32 bytes).
     let full_wire = encode_risk_params_wire(
         0, 500, 1000, 0, 64, 0, 0, 0, u64::MAX, 50, 1_000_000_000_000u128, 100, 0, 100, 1, 2,
     );
-    // RISK_PARAMS_WIRE_LEN - 3x16 = 192 - 48 = 144
-    let truncated_len = RISK_PARAMS_WIRE_LEN - 48;
+    let truncated_len = RISK_PARAMS_WIRE_LEN - 32;
     data.extend_from_slice(&full_wire[..truncated_len]);
 
     assert_decode_err(
         &data,
-        "Truncated RiskParams (missing trailing 3 fields) must be rejected",
+        "Truncated RiskParams (missing trailing dust floors) must be rejected",
     );
+}
+
+/// Fork-specific regression: upstream reads a third trailing u64 here, but this
+/// fork hardcodes `max_price_move_bps_per_slot`. A 304-byte base-only InitMarket
+/// payload must decode and let the outer decoder apply extended-tail defaults.
+#[test]
+fn init_market_base_only_payload_decodes_with_extended_defaults() {
+    let mut data = vec![TAG_INIT_MARKET];
+    data.extend_from_slice(&[0xAAu8; 32]); // admin
+    data.extend_from_slice(&[0xBBu8; 32]); // collateral_mint
+    data.extend_from_slice(&[0xABu8; 32]); // feed_id
+    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+    data.push(0u8); // invert
+    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
+    data.extend_from_slice(&encode_risk_params_wire(
+        1,
+        500,
+        1000,
+        0,
+        64,
+        1,
+        0,
+        1,
+        u64::MAX,
+        50,
+        1_000_000_000_000u128,
+        100,
+        0,
+        100,
+        21,
+        22,
+    ));
+
+    assert_eq!(data.len(), 304, "base-only InitMarket payload size");
+    match Instruction::decode(&data) {
+        Ok(Instruction::InitMarket {
+            permissionless_resolve_stale_slots,
+            funding_horizon_slots,
+            funding_k_bps,
+            funding_max_premium_bps,
+            funding_max_e9_per_slot,
+            mark_min_fee,
+            force_close_delay_slots,
+            risk_params,
+            ..
+        }) => {
+            assert_eq!(permissionless_resolve_stale_slots, 0);
+            assert_eq!(funding_horizon_slots, None);
+            assert_eq!(funding_k_bps, None);
+            assert_eq!(funding_max_premium_bps, None);
+            assert_eq!(funding_max_e9_per_slot, None);
+            assert_eq!(mark_min_fee, 0);
+            assert_eq!(force_close_delay_slots, 1);
+            assert_eq!(risk_params.min_nonzero_mm_req, 21);
+            assert_eq!(risk_params.min_nonzero_im_req, 22);
+        }
+        other => panic!("Expected base-only InitMarket to decode, got {:?}", other),
+    }
 }
 
 /// Full encode -> decode -> field-verify round-trip for RiskParams.
@@ -1021,7 +1081,7 @@ fn risk_params_full_round_trip_via_init_market() {
                 min_liq_abs,
                 "min_liquidation_abs"
             );
-            // Three mandatory trailing fields (PERC-spec: truncated payloads rejected)
+            // Mandatory trailing dust floors (PERC-spec: truncated payloads rejected)
             // v12.19: min_initial_deposit moved to wrapper policy
             let _ = min_init_deposit;
             assert_eq!(risk_params.min_nonzero_mm_req, min_nonzero_mm, "min_nonzero_mm_req");

@@ -2410,7 +2410,10 @@ pub mod ix {
         let liquidation_fee_cap = U128::new(read_u128(input)?);
         let resolve_price_deviation_bps = read_u64(input)?; // was _liquidation_buffer_bps
         let min_liquidation_abs = U128::new(read_u128(input)?);
-        if input.len() < 40 {
+        // The fork hardcodes max_price_move_bps_per_slot below instead of
+        // reading upstream's trailing u64, so only the two u128 dust floors
+        // remain after min_liquidation_abs.
+        if input.len() < 32 {
             return Err(ProgramError::InvalidInstructionData);
         }
         let min_nonzero_mm_req = read_u128(input)?;
