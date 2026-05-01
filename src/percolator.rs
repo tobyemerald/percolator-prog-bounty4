@@ -3769,7 +3769,7 @@ pub mod oracle {
     ///   non-Hyperp → config.last_good_oracle_slot (advances on successful
     ///                external Pyth/Chainlink reads)
     ///   Hyperp     → config.last_mark_push_slot (advances ONLY on
-    ///                full-weight mark observations: PushHyperpMark,
+    ///                full-weight mark observations: UpdateHyperpMark DEX reads,
     ///                or a TradeCpi fill whose fee paid the mark_min
     ///                _fee threshold). mark_ewma_last_slot is the
     ///                EWMA-math clock, NOT a liveness signal —
@@ -3935,9 +3935,9 @@ pub mod oracle {
             if mark == 0 {
                 return Err(super::error::PercolatorError::OracleInvalid.into());
             }
-            // Staleness: keyed off last trade update slot
-            let last_update = config.mark_ewma_last_slot;
-            let last_push = last_update;
+            // Staleness: keyed off the last full-weight mark observation,
+            // not the EWMA math clock.
+            let last_push = config.last_mark_push_slot as u64;
             if last_push > 0 {
                 let max_stale_slots = if config.max_staleness_secs > u64::MAX / 3 {
                     u64::MAX
@@ -14323,6 +14323,7 @@ pub mod processor {
             config.mark_ewma_last_slot = clock.slot;
             config.last_effective_price_e6 = dex_price;
             config.last_hyperp_index_slot = clock.slot;
+            config.last_mark_push_slot = clock.slot as u128;
             state::set_last_dex_liquidity_k(&mut config, dex_result.quote_liquidity);
             state::write_config(&mut data, &config);
             msg!(
@@ -14397,6 +14398,8 @@ pub mod processor {
         config.mark_ewma_e6 = new_mark;
         config.mark_ewma_last_slot = clock.slot;
         config.last_effective_price_e6 = new_index;
+        config.last_hyperp_index_slot = clock.slot;
+        config.last_mark_push_slot = clock.slot as u128;
 
         // Record pool depth for per-epoch OI cap enforcement (no-op in V12_1 layout).
         state::set_last_dex_liquidity_k(&mut config, dex_result.quote_liquidity);

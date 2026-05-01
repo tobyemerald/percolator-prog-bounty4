@@ -50,6 +50,7 @@ const RAYDIUM_CLMM_PROGRAM: Pubkey = Pubkey::new_from_array([
 
 // ─── Instruction tag constants ────────────────────────────────────────────────
 const TAG_TOP_UP_KEEPER_FUND: u8 = 57;
+const TAG_UPDATE_HYPERP_MARK: u8 = 34;
 const TAG_SET_DEX_POOL: u8 = 74;
 const TAG_INIT_MATCHER_CTX: u8 = 75;
 const TAG_EXECUTE_ADL: u8 = 50;
@@ -67,6 +68,10 @@ fn encode_set_dex_pool(pool: &Pubkey) -> Vec<u8> {
     let mut d = vec![TAG_SET_DEX_POOL];
     d.extend_from_slice(pool.as_ref());
     d
+}
+
+fn encode_update_hyperp_mark() -> Vec<u8> {
+    vec![TAG_UPDATE_HYPERP_MARK]
 }
 
 /// Encode InitMatcherCtx (tag 75) with the same parameter layout used in
@@ -115,6 +120,35 @@ fn encode_reclaim_slab_rent_mode_b() -> Vec<u8> {
 
 fn keeper_fund_pda(program_id: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"keeper_fund", slab.as_ref()], program_id)
+}
+
+fn mock_raydium_clmm_pool_data(collateral_mint: &Pubkey) -> Vec<u8> {
+    let mut data = vec![0u8; 272];
+    let quote_mint = Pubkey::new_unique();
+
+    const RAYDIUM_CLMM_OFF_MINT0: usize = 73;
+    const RAYDIUM_CLMM_OFF_MINT1: usize = 105;
+    const RAYDIUM_CLMM_OFF_DECIMALS0: usize = 233;
+    const RAYDIUM_CLMM_OFF_DECIMALS1: usize = 234;
+    const RAYDIUM_CLMM_OFF_LIQUIDITY: usize = 237;
+    const RAYDIUM_CLMM_OFF_SQRT_PRICE_X64: usize = 253;
+
+    data[RAYDIUM_CLMM_OFF_MINT0..RAYDIUM_CLMM_OFF_MINT0 + 32]
+        .copy_from_slice(collateral_mint.as_ref());
+    data[RAYDIUM_CLMM_OFF_MINT1..RAYDIUM_CLMM_OFF_MINT1 + 32]
+        .copy_from_slice(quote_mint.as_ref());
+    data[RAYDIUM_CLMM_OFF_DECIMALS0] = 6;
+    data[RAYDIUM_CLMM_OFF_DECIMALS1] = 6;
+
+    let liquidity = percolator_prog::constants::MIN_DEX_QUOTE_LIQUIDITY as u128 + 1;
+    data[RAYDIUM_CLMM_OFF_LIQUIDITY..RAYDIUM_CLMM_OFF_LIQUIDITY + 16]
+        .copy_from_slice(&liquidity.to_le_bytes());
+
+    let sqrt_price_x64 = 1u128 << 64;
+    data[RAYDIUM_CLMM_OFF_SQRT_PRICE_X64..RAYDIUM_CLMM_OFF_SQRT_PRICE_X64 + 16]
+        .copy_from_slice(&sqrt_price_x64.to_le_bytes());
+
+    data
 }
 
 // ─── Phase 1: Market Creation ─────────────────────────────────────────────────
@@ -773,6 +807,90 @@ fn test_set_dex_pool_encoding() {
     assert_eq!(encoded[0], TAG_SET_DEX_POOL, "First byte must be tag 74");
     let decoded_pool = Pubkey::new_from_array(encoded[1..33].try_into().unwrap());
     assert_eq!(decoded_pool, pool, "Pool pubkey must round-trip through encoding");
+}
+
+#[test]
+fn test_update_hyperp_mark_refreshes_full_observation_liveness() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    uncap_compute_budget(&mut env);
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let pool = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            pool,
+            Account {
+                lamports: 1_000_000,
+                data: mock_raydium_clmm_pool_data(&env.mint),
+                owner: percolator_prog::oracle::RAYDIUM_CLMM_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let set_pool_ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(pool, false),
+        ],
+        data: encode_set_dex_pool(&pool),
+    };
+    let set_pool_tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), set_pool_ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(set_pool_tx)
+        .expect("SetDexPool must accept the mock Raydium pool");
+
+    let before_data = env.svm.get_account(&env.slab).unwrap().data;
+    let before_config = percolator_prog::state::read_config(&before_data);
+    let before_push_slot = before_config.last_mark_push_slot;
+
+    let clock: Clock = env.svm.get_sysvar();
+    let update_slot = clock.slot.saturating_add(10_000);
+    env.svm.set_sysvar(&Clock {
+        slot: update_slot,
+        unix_timestamp: clock.unix_timestamp.saturating_add(50),
+        ..clock
+    });
+
+    let update_ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_update_hyperp_mark(),
+    };
+    let update_tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), update_ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(update_tx)
+        .expect("UpdateHyperpMark must accept a liquid pinned DEX observation");
+
+    let after_data = env.svm.get_account(&env.slab).unwrap().data;
+    let after_config = percolator_prog::state::read_config(&after_data);
+    assert!(
+        after_config.last_mark_push_slot > before_push_slot,
+        "UpdateHyperpMark must advance last_mark_push_slot for crank liveness"
+    );
+    assert_eq!(after_config.last_mark_push_slot, update_slot as u128);
+    assert_eq!(after_config.mark_ewma_last_slot, update_slot);
+    assert_eq!(after_config.last_hyperp_index_slot, update_slot);
 }
 
 /// Targeted test: ExecuteAdl encoding — must produce 3-byte payload.
