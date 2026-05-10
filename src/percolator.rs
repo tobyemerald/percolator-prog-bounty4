@@ -10790,36 +10790,36 @@ pub mod processor {
         verify_token_account(a_admin_ata, a_admin.key, &mint)?;
         accounts::expect_key(a_vault_pda, &auth)?;
 
-        let engine = zc::engine_mut(&mut data)?;
-
-        // Require all accounts to be fully closed (not just effective_pos_q==0,
-        // which returns 0 for epoch-mismatched stale positions).
-        // Any used account means unsettled state may remain.
-        if engine.num_used_accounts != 0 {
-            return Err(ProgramError::InvalidAccountData);
+        // PORT-18 (HIGH SF): call engine.withdraw_resolved_insurance_not_atomic
+        // (added in Wave 1 ENG-PORT-A) which folds
+        // sweep_empty_market_surplus_to_insurance into the drain. Without
+        // the sweep, rounding dust accumulated during force-closes is
+        // left stranded in the vault — admin's terminal withdraw misses
+        // those dust units. The engine helper enforces:
+        //   - market_mode == Resolved (already checked above via
+        //     state::is_resolved, but engine re-validates)
+        //   - assert_public_postconditions
+        //   - num_used_accounts == 0
+        //   - sweep_empty_market_surplus_to_insurance BEFORE the drain
+        //   - atomic insurance.balance = 0 + vault -= payout
+        //   - returns the payout amount
+        let payout = {
+            let engine = zc::engine_mut(&mut data)?;
+            engine
+                .withdraw_resolved_insurance_not_atomic()
+                .map_err(map_risk_error)?
+        };
+        if payout == 0 {
+            return Ok(()); // nothing to withdraw post-sweep
         }
 
-        // Get insurance balance and convert to base tokens
-        let insurance_units = engine.insurance_fund.balance.get();
-        if insurance_units == 0 {
-            return Ok(()); // Nothing to withdraw
-        }
-
-        // Reject if balance exceeds u64 — silent truncation would
-        // zero the engine balance but only pay out a capped amount.
-        let units_u64: u64 = insurance_units
+        // Reject if payout exceeds u64 — silent truncation would zero
+        // the engine balance but only pay out a capped amount.
+        let units_u64: u64 = payout
             .try_into()
             .map_err(|_| PercolatorError::EngineOverflow)?;
         let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
             .ok_or(PercolatorError::EngineOverflow)?;
-
-        // Zero out insurance fund and decrement engine.vault
-        engine.insurance_fund.balance = percolator::U128::ZERO;
-        let ins = percolator::U128::new(insurance_units);
-        if ins > engine.vault {
-            return Err(PercolatorError::EngineInsufficientBalance.into());
-        }
-        engine.vault = engine.vault - ins;
 
         // Transfer from vault to admin
         let seed1: &[u8] = b"vault";
