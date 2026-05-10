@@ -1092,6 +1092,76 @@ pub mod policy {
         // oracle_authority is always [0;32] since Phase G removed admin-push.
         index_feed_id != [0u8; 32]
     }
+
+    /// PORT-3-supporting (toly src/percolator.rs:620). Account-limited
+    /// operations may advance the market clock only when no per-slot
+    /// price-move or funding signal would accrue against open interest.
+    /// Spec §1.4 progress separation: market progress on exposed positions
+    /// belongs to KeeperCrank, not user value ops.
+    #[inline]
+    pub fn account_limited_op_allows_accrual(
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+        last_oracle_price: u64,
+        fresh_price: u64,
+        funding_rate_e9: i128,
+        fund_px_last: u64,
+        dt_slots: u64,
+    ) -> bool {
+        let exposed = oi_eff_long_q != 0 || oi_eff_short_q != 0;
+        if !exposed {
+            return true;
+        }
+        let price_move_active = last_oracle_price > 0 && fresh_price != last_oracle_price;
+        let funding_active = dt_slots != 0
+            && funding_rate_e9 != 0
+            && oi_eff_long_q != 0
+            && oi_eff_short_q != 0
+            && fund_px_last > 0;
+        !price_move_active && !funding_active
+    }
+
+    /// PORT-3-supporting (toly src/percolator.rs:821). Trade-CPI is allowed
+    /// only when the post-read effective price has caught up with the latest
+    /// oracle target (no target lag).
+    ///
+    /// PERCOLATOR-FORK-SPECIFIC: ML12 removed the external-oracle target
+    /// price field from fork's MarketConfig (KL-FORK-ENGINE-* deferred
+    /// subsystem), so the `external_target_e6` argument is always 0 at fork
+    /// callsites. The function still works correctly: `target == 0`
+    /// short-circuits to "allowed".
+    #[inline]
+    pub fn trade_cpi_allowed_after_oracle_read(
+        is_hyperp: bool,
+        external_target_e6: u64,
+        hyperp_target_price_e6: u64,
+        effective_price_e6: u64,
+    ) -> bool {
+        let target = if is_hyperp {
+            hyperp_target_price_e6
+        } else {
+            external_target_e6
+        };
+        target == 0 || target == effective_price_e6
+    }
+
+    /// PORT-3-supporting (toly src/percolator.rs:846). Fee sync must never
+    /// advance beyond the market boundary that has already been
+    /// economically accrued. Live markets use last_market_slot; resolved
+    /// markets use the immutable resolved_slot.
+    #[inline]
+    pub fn fee_sync_anchor_within_accrued_boundary(
+        is_resolved: bool,
+        anchor_slot: u64,
+        last_market_slot: u64,
+        resolved_slot: u64,
+    ) -> bool {
+        if is_resolved {
+            anchor_slot <= resolved_slot
+        } else {
+            anchor_slot <= last_market_slot
+        }
+    }
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -6420,6 +6490,201 @@ pub mod processor {
     ) -> Result<(), ProgramError> {
         reject_stuck_target_accrual(config, engine, now_slot, price)?;
         ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)
+    }
+
+    /// PORT-3-supporting (toly:4067). Engine.market_mode resolved predicate.
+    #[inline]
+    fn engine_is_resolved(engine: &RiskEngine) -> bool {
+        engine.market_mode == percolator::MarketMode::Resolved
+    }
+
+    /// PORT-3-supporting (toly:4072). Returns (resolved_price, resolved_slot)
+    /// snapshot of the engine's terminal state.
+    #[inline]
+    fn engine_resolved_context(engine: &RiskEngine) -> (u64, u64) {
+        (engine.resolved_price, engine.resolved_slot)
+    }
+
+    /// PORT-3-supporting (toly:4503). Reject account-limited operations that
+    /// would inadvertently advance the market clock for unrelated exposed
+    /// accounts. Surfaces CatchupRequired so the caller routes through
+    /// KeeperCrank first.
+    fn reject_account_limited_market_progress(
+        engine: &RiskEngine,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<(), ProgramError> {
+        let dt_slots = now_slot.saturating_sub(engine.last_market_slot);
+        if !crate::policy::account_limited_op_allows_accrual(
+            engine.oi_eff_long_q,
+            engine.oi_eff_short_q,
+            engine.last_oracle_price,
+            price,
+            funding_rate_e9,
+            engine.fund_px_last,
+            dt_slots,
+        ) {
+            return Err(PercolatorError::CatchupRequired.into());
+        }
+        Ok(())
+    }
+
+    /// PORT-3-supporting (toly:4524). Compose
+    /// reject_stuck_target_accrual + reject_account_limited_market_progress
+    /// + ensure_market_accrued_to_now for the user-value ops that touch
+    /// only their own account (TradeCpi, DepositFeeCredits,
+    /// ConvertReleasedPnl, ResolveDispute, ClaimQueuedWithdrawal).
+    fn ensure_market_accrued_to_now_for_account_limited_op(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<(), ProgramError> {
+        reject_stuck_target_accrual(config, engine, now_slot, price)?;
+        reject_account_limited_market_progress(engine, now_slot, price, funding_rate_e9)?;
+        ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)
+    }
+
+    /// PORT-3-supporting (toly:3858). Sync per-account fee_slot to `now_slot`
+    /// after an authoritative engine touch (settle_account_not_atomic, keeper
+    /// touch). Gated by fee_sync_anchor_within_accrued_boundary so the sync
+    /// can't cross past the market's accrued boundary. No-op when
+    /// maintenance_fee_per_slot == 0.
+    fn sync_account_fee_after_authoritative_touch(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        idx: u16,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if config.maintenance_fee_per_slot == 0 {
+            return Ok(());
+        }
+        check_idx(engine, idx)?;
+        let is_resolved = engine_is_resolved(engine);
+        let resolved_slot = if is_resolved {
+            engine_resolved_context(engine).1
+        } else {
+            0
+        };
+        if !crate::policy::fee_sync_anchor_within_accrued_boundary(
+            is_resolved,
+            now_slot,
+            engine.last_market_slot,
+            resolved_slot,
+        ) {
+            return Err(PercolatorError::CatchupRequired.into());
+        }
+        engine
+            .sync_account_fee_to_slot_not_atomic(idx, now_slot, config.maintenance_fee_per_slot)
+            .map_err(map_risk_error)
+    }
+
+    /// PORT-3-supporting (toly:3887). Settle a single account then sync its
+    /// per-slot maintenance fee anchor to `now_slot`. Used to make recurring
+    /// fees junior to losses (spec §6) before TradeCpi / TradeNoCpi.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_account_then_sync_fee_current(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        idx: u16,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+        admit_h_min: u64,
+        admit_h_max: u64,
+        admit_threshold: Option<u128>,
+    ) -> Result<(), ProgramError> {
+        engine
+            .settle_account_not_atomic(
+                idx,
+                price,
+                now_slot,
+                funding_rate_e9,
+                admit_h_min,
+                admit_h_max,
+                admit_threshold,
+            )
+            .map_err(map_risk_error)?;
+        sync_account_fee_after_authoritative_touch(engine, config, idx, now_slot)
+    }
+
+    /// PORT-3-supporting (toly:3912). Settle two accounts (in canonical
+    /// `(min_idx, max_idx)` order) then sync each fee anchor. Used by
+    /// TradeCpi to pre-settle (lp, user) before the matcher CPI.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_pair_then_sync_fee_current(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        a: u16,
+        b: u16,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+        admit_h_min: u64,
+        admit_h_max: u64,
+        admit_threshold: Option<u128>,
+    ) -> Result<(), ProgramError> {
+        let (first, second) = if a <= b { (a, b) } else { (b, a) };
+        settle_account_then_sync_fee_current(
+            engine,
+            config,
+            first,
+            now_slot,
+            price,
+            funding_rate_e9,
+            admit_h_min,
+            admit_h_max,
+            admit_threshold,
+        )?;
+        settle_account_then_sync_fee_current(
+            engine,
+            config,
+            second,
+            now_slot,
+            price,
+            funding_rate_e9,
+            admit_h_min,
+            admit_h_max,
+            admit_threshold,
+        )
+    }
+
+    /// PORT-3-supporting (toly:4154). Two-sided trading-fee cap: the maximum
+    /// fee a single trade can possibly generate, used to bound the
+    /// insurance-delta measurement that drives mark-EWMA fee weighting.
+    /// Without this cap, an unrelated insurance top-up landing in the same
+    /// engine call could inflate `fee_paid` and let dust trades cross the
+    /// `mark_min_fee` threshold.
+    fn current_trade_fee_paid_cap(
+        size: i128,
+        exec_price: u64,
+        trading_fee_bps: u64,
+    ) -> Result<u128, ProgramError> {
+        if trading_fee_bps == 0 || size == 0 {
+            return Ok(0);
+        }
+        let abs_size = size.unsigned_abs();
+        // notional = floor(abs_size * exec_price / POS_SCALE)
+        let notional_num = abs_size
+            .checked_mul(exec_price as u128)
+            .ok_or(PercolatorError::EngineOverflow)?;
+        let notional = notional_num / percolator::POS_SCALE;
+        if notional == 0 {
+            return Ok(0);
+        }
+        // ceil(notional * trading_fee_bps / 10_000)
+        let one_side_num = notional
+            .checked_mul(trading_fee_bps as u128)
+            .ok_or(PercolatorError::EngineOverflow)?;
+        let one_side_fee = one_side_num
+            .checked_add(10_000 - 1)
+            .ok_or(PercolatorError::EngineOverflow)?
+            / 10_000;
+        one_side_fee
+            .checked_mul(2)
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
     }
 
     /// Incrementally sweep maintenance fees from the current cursor position.
