@@ -24,16 +24,24 @@ pub use std::path::PathBuf;
 // +32 for pending_admin). SLAB_LEN tracks via percolator_prog::constants::SLAB_LEN
 // but is hardcoded here because the tests' BPF layout is a 32-bit SBF target
 // that doesn't match the host constant.
-// v12.19 sync: wrapper logs `0x1747d8 = 1_525_208` as compile-time SLAB_LEN.
-// The large-tier default still needs the historical +512 byte LiteSVM padding,
-// but small-tier SBF expects the exact on-chain small slab length.
+// v12.19 sync: wrapper logged `0x1747d8 = 1_525_208` as compile-time SLAB_LEN.
+// Wave 1 (engine PR #91 @ 8e3df3db) added 16 bytes to RiskEngine
+// (oracle_target_price_e6 + oracle_target_publish_time), bumping wrapper
+// compile-time SLAB_LEN to `0x1747e8 = 1_525_224`. The large-tier default
+// still needs the historical +512 byte LiteSVM padding, so the constant
+// is `1_525_224 + 512 = 1_525_736`.
+//
+// Small-tier carries pre-existing drift (program logs 0x17a10 = 96_784
+// vs hardcoded 96_760) that pre-dates Wave 1; use --features small only
+// when explicitly testing the small build, and update that constant in
+// a separate fixture sweep when needed.
 #[cfg(all(feature = "small", not(feature = "medium")))]
 pub const SLAB_LEN: usize = 96_760;
 #[cfg(all(feature = "small", not(feature = "medium")))]
 pub const MAX_ACCOUNTS: usize = 256;
 
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
-pub const SLAB_LEN: usize = 1_525_208 + 512;
+pub const SLAB_LEN: usize = 1_525_224 + 512;
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const MAX_ACCOUNTS: usize = 4096;
 
@@ -5657,6 +5665,11 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),    // 3: vault
                 AccountMeta::new_readonly(spl_token::ID, false), // 4: token_program
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // 5: clock
+                // PORT-20 (Wave 3): account [6] = oracle (pyth_index for
+                // non-Hyperp markets). Tag 27 wire format grew from 6 to
+                // 7 accounts so the wrapper can run accrue + target-lag
+                // preconditions before deposit_fee_credits.
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data,
         };

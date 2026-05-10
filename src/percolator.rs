@@ -6014,7 +6014,14 @@ pub mod processor {
         clock_slot: u64,
         slab_data: Option<&mut [u8]>,
     ) -> Result<u64, ProgramError> {
-        let external_ok = oracle::read_engine_price_e6(
+        // PORT-11 (HIGH SF / KL-FORK-ENGINE-FIELDS-revoked): capture the
+        // external observation's publish_time so we can gate
+        // `last_good_oracle_slot` advancement on strict publish_time
+        // advance (defeats Pyth-publish replay against the
+        // permissionless-stale-maturity timer). Wave 1 ENG-PORT-C added
+        // `engine.oracle_target_publish_time` so the wrapper now has a
+        // monotonic baseline to compare against.
+        let external = oracle::read_engine_price_e6(
             a_oracle,
             &config.index_feed_id,
             clock_unix_ts,
@@ -6022,7 +6029,11 @@ pub mod processor {
             config.conf_filter_bps,
             config.invert,
             config.unit_scale,
-        ).is_ok();
+        );
+        let ext_pub_time: Option<i64> = match &external {
+            Ok((_, pub_time)) => Some(*pub_time),
+            Err(_) => None,
+        };
 
         // ML12 added p_last + price_move_dt_slots + oi_any to enforce the
         // engine's per-slot price-move cap. read_price_and_stamp doesn't
@@ -6033,15 +6044,44 @@ pub mod processor {
         let _last_p = config.last_effective_price_e6;
         let price = oracle::read_price_clamped(config, a_oracle, clock_unix_ts, _cap, _last_p, 1, false)?;
 
-        if external_ok {
-            config.last_good_oracle_slot = clock_slot;
+        // PORT-11: gate last_good_oracle_slot stamp on strict publish_time
+        // advance against engine.oracle_target_publish_time. When the
+        // caller has slab access, also write the new publish_time back to
+        // engine.oracle_target_publish_time atomically so subsequent reads
+        // see the advanced baseline. When the caller doesn't pass slab_data
+        // (e.g., InitMarket cold path), fall back to the existing
+        // success-only stamp behavior — that path doesn't have the
+        // engine-state context to compare against.
+        if let Some(pub_time) = ext_pub_time {
+            match slab_data {
+                Some(data) => {
+                    let engine = zc::engine_mut(data)?;
+                    if pub_time > engine.oracle_target_publish_time {
+                        engine.oracle_target_publish_time = pub_time;
+                        // Optionally also update target price tracking; only
+                        // stamp last_good_oracle_slot on strict advance to
+                        // prevent replay refresh of the liveness clock.
+                        config.last_good_oracle_slot = clock_slot;
+                    }
+                    // else: stale or replayed publish — engine clock and
+                    // wrapper liveness clock both stay where they were.
+                }
+                None => {
+                    // PERCOLATOR-FORK-SPECIFIC: fallback path. Without
+                    // slab access we can't read engine.oracle_target_publish_time,
+                    // so we conservatively keep the pre-PORT-11 behavior
+                    // (stamp on any successful read). Callers in the
+                    // hot path (TradeCpi, ConvertReleasedPnl, etc.) all
+                    // pass Some(slab) so they get the strict-advance gate.
+                    config.last_good_oracle_slot = clock_slot;
+                }
+            }
         }
         // NOTE: FLAG_ORACLE_INITIALIZED is NOT set here.
         // The flag means "engine.last_oracle_price is a real price" which is
         // only true after the engine processes it via accrue_market_to or similar.
         // Setting it on wrapper read alone would be unsound because zero-fill
         // and other early-return paths skip the engine call.
-        let _ = slab_data; // reserved for future per-read slab stamping
         Ok(price)
     }
 
@@ -10790,36 +10830,36 @@ pub mod processor {
         verify_token_account(a_admin_ata, a_admin.key, &mint)?;
         accounts::expect_key(a_vault_pda, &auth)?;
 
-        let engine = zc::engine_mut(&mut data)?;
-
-        // Require all accounts to be fully closed (not just effective_pos_q==0,
-        // which returns 0 for epoch-mismatched stale positions).
-        // Any used account means unsettled state may remain.
-        if engine.num_used_accounts != 0 {
-            return Err(ProgramError::InvalidAccountData);
+        // PORT-18 (HIGH SF): call engine.withdraw_resolved_insurance_not_atomic
+        // (added in Wave 1 ENG-PORT-A) which folds
+        // sweep_empty_market_surplus_to_insurance into the drain. Without
+        // the sweep, rounding dust accumulated during force-closes is
+        // left stranded in the vault — admin's terminal withdraw misses
+        // those dust units. The engine helper enforces:
+        //   - market_mode == Resolved (already checked above via
+        //     state::is_resolved, but engine re-validates)
+        //   - assert_public_postconditions
+        //   - num_used_accounts == 0
+        //   - sweep_empty_market_surplus_to_insurance BEFORE the drain
+        //   - atomic insurance.balance = 0 + vault -= payout
+        //   - returns the payout amount
+        let payout = {
+            let engine = zc::engine_mut(&mut data)?;
+            engine
+                .withdraw_resolved_insurance_not_atomic()
+                .map_err(map_risk_error)?
+        };
+        if payout == 0 {
+            return Ok(()); // nothing to withdraw post-sweep
         }
 
-        // Get insurance balance and convert to base tokens
-        let insurance_units = engine.insurance_fund.balance.get();
-        if insurance_units == 0 {
-            return Ok(()); // Nothing to withdraw
-        }
-
-        // Reject if balance exceeds u64 — silent truncation would
-        // zero the engine balance but only pay out a capped amount.
-        let units_u64: u64 = insurance_units
+        // Reject if payout exceeds u64 — silent truncation would zero
+        // the engine balance but only pay out a capped amount.
+        let units_u64: u64 = payout
             .try_into()
             .map_err(|_| PercolatorError::EngineOverflow)?;
         let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
             .ok_or(PercolatorError::EngineOverflow)?;
-
-        // Zero out insurance fund and decrement engine.vault
-        engine.insurance_fund.balance = percolator::U128::ZERO;
-        let ins = percolator::U128::new(insurance_units);
-        if ins > engine.vault {
-            return Err(PercolatorError::EngineInsufficientBalance.into());
-        }
-        engine.vault = engine.vault - ins;
 
         // Transfer from vault to admin
         let seed1: &[u8] = b"vault";
@@ -10964,10 +11004,21 @@ pub mod processor {
         } else {
             (0u16, crate::INS_WITHDRAW_LAST_SLOT_NONE)
         };
+        // PORT-12 (HIGH SF / KL-INSURANCE-WITHDRAW-POLICY-1): bounded
+        // path uses `header.insurance_operator` rather than `header.admin`.
+        // Toly's prose: "the bounded path requires insurance_operator;
+        // fork's admin/hyperp_authority gating is too broad." The auth
+        // split is load-bearing: an admin who has burned admin can still
+        // withdraw bounded insurance via insurance_operator, OR lock
+        // bounded withdrawal forever by burning insurance_operator —
+        // independent of admin lifecycle. At market genesis,
+        // insurance_operator is initialized to admin (fork:8243) so
+        // markets that haven't rotated the operator separately keep
+        // working with the same signing key.
         let policy_authority = if configured {
             config.hyperp_authority
         } else {
-            header.admin
+            header.insurance_operator
         };
         let policy_min_base = if configured {
             config.last_effective_price_e6
@@ -11261,7 +11312,17 @@ pub mod processor {
         let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
         verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-        let amt_units = match engine.force_close_resolved_not_atomic(user_idx)
+        // PORT-19 (HIGH SF): Tag 21 admin force-close-with-fee. Use the
+        // with_fee variant added in Wave 1 ENG-PORT-B so admin-driven
+        // resolved closes charge accrued maintenance fees at the
+        // resolved-slot anchor (matching toly's spec-§9.9 step 5
+        // ordering). Was: `force_close_resolved_not_atomic` which
+        // skipped the fee charge as fork's prior FEATURE-DIVERGENCE.
+        let amt_units = match engine
+            .force_close_resolved_with_fee_not_atomic(
+                user_idx,
+                config.maintenance_fee_per_slot,
+            )
             .map_err(map_risk_error)?
         {
             percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -11419,13 +11480,22 @@ pub mod processor {
         // SECURITY: Read fee debt BEFORE the SPL transfer to reject
         // overpayment. Without this, excess tokens become stranded
         // vault surplus with no withdrawal path for the user.
-        accounts::expect_len(accounts, 6)?;
+        //
+        // PORT-20 (HIGH SF): wire-format change — account [6] is now the
+        // oracle account. The pre-engine accrue + target-lag gates that
+        // landed for Tag 28 (PORT-21) and other account-limited ops
+        // require a live oracle price. Toly's tag 27 already takes the
+        // oracle account; fork hadn't carried the wire change forward.
+        // SDKs constructing Tag 27 transactions must now pass the same
+        // Pyth/Chainlink account they pass to other market touchpoints.
+        accounts::expect_len(accounts, 7)?;
         let a_user = &accounts[0];
         let a_slab = &accounts[1];
         let a_user_ata = &accounts[2];
         let a_vault = &accounts[3];
         let a_token = &accounts[4];
         let a_clock = &accounts[5];
+        let a_oracle = &accounts[6];
 
         accounts::expect_signer(a_user)?;
         accounts::expect_writable(a_slab)?;
@@ -11472,17 +11542,49 @@ pub mod processor {
         // Phase 3: SPL transfer (only after validation)
         collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-        // Phase 4: Engine deposit_fee_credits (mutable borrow)
-        // Vault already verified in Phase 1.
+        // Phase 4: Engine deposit_fee_credits (mutable borrow).
+        // PORT-20 (HIGH SF): pre-call accrue + target-lag gates so
+        // deposit_fee_credits sees post-funding state. The flow is the
+        // same account-limited-op pattern landed for Tag 10 (PORT-3c)
+        // and Tag 28 (PORT-21):
+        //   1. capture funding rate BEFORE oracle read (anti-retroactivity §5.5)
+        //   2. read live oracle (non-Hyperp) or cached engine price (Hyperp)
+        //   3. ensure_market_accrued_to_now_for_account_limited_op
+        //   4. reject_any_target_lag
+        //   5. engine.deposit_fee_credits (existing engine call)
         let mut data = state::slab_data_mut(a_slab)?;
-        let config = state::read_config(&data);
+        let mut config = state::read_config(&data);
         let clock = Clock::from_account_info(a_clock)?;
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
+        let is_hyperp = oracle::is_hyperp_mode(&config);
+        let price = if is_hyperp {
+            let engine = zc::engine_ref(&data)?;
+            engine.last_oracle_price
+        } else {
+            let p = read_price_and_stamp(
+                &mut config,
+                a_oracle,
+                clock.unix_timestamp,
+                clock.slot,
+                Some(&mut data),
+            )?;
+            state::write_config(&mut data, &config);
+            p
+        };
         let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
         // dust is always 0 here — rejected by `dust != 0` check in Phase 2.
 
         let engine = zc::engine_mut(&mut data)?;
-        engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
+        ensure_market_accrued_to_now_for_account_limited_op(
+            engine, &config, clock.slot, price, funding_rate_e9,
+        )?;
+        reject_any_target_lag(&config, engine)?;
+        engine
+            .deposit_fee_credits(user_idx, units2 as u128, clock.slot)
             .map_err(map_risk_error)?;
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
         Ok(())
     }
 
@@ -11751,7 +11853,15 @@ pub mod processor {
         );
         verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-        let amt_units = match engine.force_close_resolved_not_atomic(user_idx)
+        // PORT-19 (HIGH SF): Tag 30 force-close-resolved-with-fee. Same
+        // rationale as Tag 21 above — use the with_fee variant from
+        // Wave 1 ENG-PORT-B so the permissionless force-close path
+        // charges maintenance fees at resolved-slot anchor.
+        let amt_units = match engine
+            .force_close_resolved_with_fee_not_atomic(
+                user_idx,
+                config.maintenance_fee_per_slot,
+            )
             .map_err(map_risk_error)?
         {
             percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -12697,12 +12807,45 @@ pub mod processor {
         if accept != 0 {
             dispute.outcome = 1;
 
-            let mut slab_data = state::slab_data_mut(a_slab)?;
-            let config_w = state::read_config(&slab_data);
-            // settlement_price_e6 not in current layout — update is no-op
-            let _ = dispute.proposed_price_e6;
-            state::write_config(&mut slab_data, &config_w);
-            drop(slab_data);
+            // FIX-6 (HIGH SF / FIX_QUEUE.md FIX-6): IMPLEMENT settlement
+            // update — propagate the challenger's proposed price into
+            // engine.resolved_price and reset the resolved-payout
+            // snapshot so subsequent ForceCloseResolved /
+            // WithdrawInsurance calls use the new price.
+            //
+            // Was: a no-op (commented "settlement_price_e6 not in current
+            // layout — update is no-op"). The bond was paid and the log
+            // was emitted, but the resolved price was unchanged — a
+            // dispute "won" by the challenger had no on-chain effect
+            // beyond bond reimbursement.
+            //
+            // Now: validate the proposed price, write it into
+            // engine.resolved_price (engine field is `pub`), and clear
+            // resolved_payout_ready/h_num/h_den so the next force-close
+            // recomputes the haircut snapshot against the new price.
+            // Already-closed accounts retain their settled state; only
+            // accounts not yet closed see the dispute outcome.
+            if dispute.proposed_price_e6 == 0
+                || dispute.proposed_price_e6 > percolator::MAX_ORACLE_PRICE
+            {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            {
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let engine = zc::engine_mut(&mut slab_data)?;
+                if engine.market_mode != percolator::MarketMode::Resolved {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                engine.resolved_price = dispute.proposed_price_e6;
+                // Reset the terminal-payout snapshot — the per-account
+                // haircut numerator/denominator must be re-derived from
+                // the new resolved_price on the next ForceCloseResolved
+                // touch (spec §9.9).
+                engine.resolved_payout_h_num = 0;
+                engine.resolved_payout_h_den = 0;
+                engine.resolved_payout_ready = 0;
+                drop(slab_data);
+            }
 
             if dispute.bond_amount > 0 {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
@@ -12736,7 +12879,7 @@ pub mod processor {
             }
 
             msg!(
-                "PERC-314: Dispute accepted — settlement updated to {}",
+                "PERC-314: Dispute accepted — engine.resolved_price updated to {}",
                 dispute.proposed_price_e6
             );
         } else {
@@ -13125,7 +13268,14 @@ pub mod processor {
     fn handle_claim_queued_withdrawal<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
-        accounts::expect_len(accounts, 10)?;
+        // FIX-7 (HIGH SF / FORK_ONLY_BUGS Tag 48): account list grows
+        // by one (creator_lock at [10]) so the queued-withdrawal redemption
+        // path can enforce the same lockup invariant as Tag 39
+        // (handle_lp_vault_withdraw). Without this, a creator under an
+        // active lockup could sidestep the lock by queuing via Tag 47 and
+        // draining tranche-by-tranche via Tag 48 — the queued path
+        // bypassed the creator-lock check entirely.
+        accounts::expect_len(accounts, 11)?;
         let a_user = &accounts[0];
         let a_slab = &accounts[1];
         let a_queue = &accounts[2];
@@ -13136,6 +13286,7 @@ pub mod processor {
         let a_vault_authority = &accounts[7];
         let a_token = &accounts[8];
         let a_lp_vault_state = &accounts[9];
+        let a_creator_lock = &accounts[10];
 
         accounts::expect_signer(a_user)?;
         accounts::expect_writable(a_slab)?;
@@ -13299,6 +13450,47 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineOverflow)?,
         );
         drop(slab_data);
+
+        // FIX-7 (HIGH SF / FORK_ONLY_BUGS Tag 48): if caller is the
+        // market creator under an active lockup, decrement
+        // lp_amount_locked by `claimable` so the queued-withdrawal path
+        // honors the same lockup ceiling as Tag 39. The locked LP that
+        // the queue was funded from must be released back to the lock
+        // before the burn so subsequent direct withdraws (Tag 39) see
+        // the post-claim balance.
+        {
+            let (expected_lock_pda, _) = Pubkey::find_program_address(
+                &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                program_id,
+            );
+            accounts::expect_key(a_creator_lock, &expected_lock_pda)?;
+            if a_creator_lock.is_writable {
+                let mut lock_data = a_creator_lock
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                    let creator_key = Pubkey::new_from_array(lock_state.creator);
+                    if *a_user.key == creator_key {
+                        let mut new_lock = *lock_state;
+                        new_lock.lp_amount_locked = new_lock
+                            .lp_amount_locked
+                            .saturating_sub(claimable);
+                        new_lock.cumulative_extracted = new_lock
+                            .cumulative_extracted
+                            .saturating_add(claimable);
+                        if crate::creator_lock::check_extraction_exceeded(
+                            new_lock.cumulative_extracted,
+                            new_lock.cumulative_deposited,
+                            crate::creator_lock::EXTRACTION_LIMIT_BPS,
+                        ) {
+                            new_lock.fee_redirect_active = 1;
+                            msg!("CREATOR_LOCK: fee redirect activated (Tag 48)");
+                        }
+                        crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                    }
+                }
+            }
+        }
 
         crate::insurance_lp::burn(
             a_token,
