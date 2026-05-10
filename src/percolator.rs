@@ -12777,17 +12777,15 @@ pub mod processor {
 
         let clock = Clock::get()?;
 
+        // FIX-1 (CRITICAL-3): `engine.deposit_not_atomic` already writes
+        // the vault internally (engine src/percolator.rs:5065). The
+        // previous wrapper-side `engine.vault += collateral_units`
+        // double-credited the deposit, inflating the vault by 2x the
+        // amount actually transferred via the SPL token CPI. Trust the
+        // engine's atomic write and remove the wrapper mutation.
         engine
             .deposit_not_atomic(user_idx, collateral_units, clock.slot)
             .map_err(map_risk_error)?;
-
-        engine.vault = percolator::U128::new(
-            engine
-                .vault
-                .get()
-                .checked_add(collateral_units)
-                .ok_or(PercolatorError::EngineOverflow)?,
-        );
         drop(slab_data);
 
         collateral::deposit(a_token, a_user_lp_ata, a_lp_escrow, a_user, lp_amount)?;
@@ -12806,7 +12804,13 @@ pub mod processor {
         user_idx: u16,
         lp_amount: u64,
     ) -> ProgramResult {
-        accounts::expect_len(accounts, 8)?;
+        // FIX-3 (CRITICAL-3) — wire format change: account [8] is the
+        // oracle. engine.withdraw_not_atomic rejects oracle_price == 0
+        // (engine:5123-5125) so the prior 8-account form was always
+        // broken on non-Hyperp markets. SDKs constructing Tag 46 must
+        // pass the same Pyth/Chainlink account used elsewhere in the
+        // market.
+        accounts::expect_len(accounts, 9)?;
         let a_user = &accounts[0];
         let a_slab = &accounts[1];
         let a_user_lp_ata = &accounts[2];
@@ -12815,6 +12819,7 @@ pub mod processor {
         let a_token = &accounts[5];
         let a_lp_escrow = &accounts[6];
         let a_vault_authority = &accounts[7];
+        let a_oracle = &accounts[8];
 
         accounts::expect_signer(a_user)?;
         accounts::expect_writable(a_slab)?;
@@ -12868,20 +12873,61 @@ pub mod processor {
         );
 
         let mut slab_data = state::slab_data_mut(a_slab)?;
-        let engine = zc::engine_mut(&mut slab_data)?;
-
+        // FIX-3 (CRITICAL-3): re-read config from slab to allow
+        // read_price_and_stamp to mutate the borrowed copy.
+        let mut config_w = state::read_config(&slab_data);
         let clock = Clock::get()?;
+        // FIX-3: read the oracle price for non-Hyperp markets so
+        // engine.withdraw_not_atomic's `oracle_price > 0` precondition
+        // holds. Hyperp markets use `engine.last_oracle_price` (cached
+        // mark) since they have no external oracle account.
+        let oracle_price = if oracle::is_hyperp_mode(&config_w) {
+            let engine_r = zc::engine_ref(&slab_data)?;
+            let p = engine_r.last_oracle_price;
+            if p == 0 {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            p
+        } else {
+            let p = read_price_and_stamp(
+                &mut config_w,
+                a_oracle,
+                clock.unix_timestamp,
+                clock.slot,
+                Some(&mut slab_data),
+            )?;
+            state::write_config(&mut slab_data, &config_w);
+            p
+        };
+        // FIX-3: capture funding rate post-config-mutation; the engine
+        // accrual + withdraw will use the current config's funding view.
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config_w)?;
+        // FIX-3: ensure the engine market clock is current for
+        // account-limited ops before withdraw_not_atomic decides
+        // admission against post-funding capital.
+        {
+            let engine = zc::engine_mut(&mut slab_data)?;
+            ensure_market_accrued_to_now_for_account_limited_op(
+                engine, &config_w, clock.slot, oracle_price, funding_rate_e9,
+            )?;
+        }
+        let engine = zc::engine_mut(&mut slab_data)?;
+        // FIX-1 (CRITICAL-3): same double-mutation issue as Tag 45.
+        // engine.withdraw_not_atomic writes the vault internally
+        // (engine:5104). The wrapper's prior `engine.vault -= collateral_units`
+        // double-deducted, deflating the vault by 2x.
         engine
-            .withdraw_not_atomic(user_idx, collateral_units, 0, clock.slot, 0, engine.params.h_min, engine.params.h_max, None)
+            .withdraw_not_atomic(
+                user_idx,
+                collateral_units,
+                oracle_price,
+                clock.slot,
+                funding_rate_e9,
+                engine.params.h_min,
+                engine.params.h_max,
+                None,
+            )
             .map_err(map_risk_error)?;
-
-        engine.vault = percolator::U128::new(
-            engine
-                .vault
-                .get()
-                .checked_sub(collateral_units)
-                .ok_or(PercolatorError::EngineOverflow)?,
-        );
         drop(slab_data);
 
         // Use stored vault_authority_bump (~1500 CU cheaper than find_program_address)
