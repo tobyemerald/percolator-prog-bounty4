@@ -6014,7 +6014,14 @@ pub mod processor {
         clock_slot: u64,
         slab_data: Option<&mut [u8]>,
     ) -> Result<u64, ProgramError> {
-        let external_ok = oracle::read_engine_price_e6(
+        // PORT-11 (HIGH SF / KL-FORK-ENGINE-FIELDS-revoked): capture the
+        // external observation's publish_time so we can gate
+        // `last_good_oracle_slot` advancement on strict publish_time
+        // advance (defeats Pyth-publish replay against the
+        // permissionless-stale-maturity timer). Wave 1 ENG-PORT-C added
+        // `engine.oracle_target_publish_time` so the wrapper now has a
+        // monotonic baseline to compare against.
+        let external = oracle::read_engine_price_e6(
             a_oracle,
             &config.index_feed_id,
             clock_unix_ts,
@@ -6022,7 +6029,11 @@ pub mod processor {
             config.conf_filter_bps,
             config.invert,
             config.unit_scale,
-        ).is_ok();
+        );
+        let ext_pub_time: Option<i64> = match &external {
+            Ok((_, pub_time)) => Some(*pub_time),
+            Err(_) => None,
+        };
 
         // ML12 added p_last + price_move_dt_slots + oi_any to enforce the
         // engine's per-slot price-move cap. read_price_and_stamp doesn't
@@ -6033,15 +6044,44 @@ pub mod processor {
         let _last_p = config.last_effective_price_e6;
         let price = oracle::read_price_clamped(config, a_oracle, clock_unix_ts, _cap, _last_p, 1, false)?;
 
-        if external_ok {
-            config.last_good_oracle_slot = clock_slot;
+        // PORT-11: gate last_good_oracle_slot stamp on strict publish_time
+        // advance against engine.oracle_target_publish_time. When the
+        // caller has slab access, also write the new publish_time back to
+        // engine.oracle_target_publish_time atomically so subsequent reads
+        // see the advanced baseline. When the caller doesn't pass slab_data
+        // (e.g., InitMarket cold path), fall back to the existing
+        // success-only stamp behavior — that path doesn't have the
+        // engine-state context to compare against.
+        if let Some(pub_time) = ext_pub_time {
+            match slab_data {
+                Some(data) => {
+                    let engine = zc::engine_mut(data)?;
+                    if pub_time > engine.oracle_target_publish_time {
+                        engine.oracle_target_publish_time = pub_time;
+                        // Optionally also update target price tracking; only
+                        // stamp last_good_oracle_slot on strict advance to
+                        // prevent replay refresh of the liveness clock.
+                        config.last_good_oracle_slot = clock_slot;
+                    }
+                    // else: stale or replayed publish — engine clock and
+                    // wrapper liveness clock both stay where they were.
+                }
+                None => {
+                    // PERCOLATOR-FORK-SPECIFIC: fallback path. Without
+                    // slab access we can't read engine.oracle_target_publish_time,
+                    // so we conservatively keep the pre-PORT-11 behavior
+                    // (stamp on any successful read). Callers in the
+                    // hot path (TradeCpi, ConvertReleasedPnl, etc.) all
+                    // pass Some(slab) so they get the strict-advance gate.
+                    config.last_good_oracle_slot = clock_slot;
+                }
+            }
         }
         // NOTE: FLAG_ORACLE_INITIALIZED is NOT set here.
         // The flag means "engine.last_oracle_price is a real price" which is
         // only true after the engine processes it via accrue_market_to or similar.
         // Setting it on wrapper read alone would be unsound because zero-fill
         // and other early-return paths skip the engine call.
-        let _ = slab_data; // reserved for future per-read slab stamping
         Ok(price)
     }
 
