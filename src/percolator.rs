@@ -12749,12 +12749,45 @@ pub mod processor {
         if accept != 0 {
             dispute.outcome = 1;
 
-            let mut slab_data = state::slab_data_mut(a_slab)?;
-            let config_w = state::read_config(&slab_data);
-            // settlement_price_e6 not in current layout — update is no-op
-            let _ = dispute.proposed_price_e6;
-            state::write_config(&mut slab_data, &config_w);
-            drop(slab_data);
+            // FIX-6 (HIGH SF / FIX_QUEUE.md FIX-6): IMPLEMENT settlement
+            // update — propagate the challenger's proposed price into
+            // engine.resolved_price and reset the resolved-payout
+            // snapshot so subsequent ForceCloseResolved /
+            // WithdrawInsurance calls use the new price.
+            //
+            // Was: a no-op (commented "settlement_price_e6 not in current
+            // layout — update is no-op"). The bond was paid and the log
+            // was emitted, but the resolved price was unchanged — a
+            // dispute "won" by the challenger had no on-chain effect
+            // beyond bond reimbursement.
+            //
+            // Now: validate the proposed price, write it into
+            // engine.resolved_price (engine field is `pub`), and clear
+            // resolved_payout_ready/h_num/h_den so the next force-close
+            // recomputes the haircut snapshot against the new price.
+            // Already-closed accounts retain their settled state; only
+            // accounts not yet closed see the dispute outcome.
+            if dispute.proposed_price_e6 == 0
+                || dispute.proposed_price_e6 > percolator::MAX_ORACLE_PRICE
+            {
+                return Err(PercolatorError::OracleInvalid.into());
+            }
+            {
+                let mut slab_data = state::slab_data_mut(a_slab)?;
+                let engine = zc::engine_mut(&mut slab_data)?;
+                if engine.market_mode != percolator::MarketMode::Resolved {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                engine.resolved_price = dispute.proposed_price_e6;
+                // Reset the terminal-payout snapshot — the per-account
+                // haircut numerator/denominator must be re-derived from
+                // the new resolved_price on the next ForceCloseResolved
+                // touch (spec §9.9).
+                engine.resolved_payout_h_num = 0;
+                engine.resolved_payout_h_den = 0;
+                engine.resolved_payout_ready = 0;
+                drop(slab_data);
+            }
 
             if dispute.bond_amount > 0 {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
@@ -12788,7 +12821,7 @@ pub mod processor {
             }
 
             msg!(
-                "PERC-314: Dispute accepted — settlement updated to {}",
+                "PERC-314: Dispute accepted — engine.resolved_price updated to {}",
                 dispute.proposed_price_e6
             );
         } else {
