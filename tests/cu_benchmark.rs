@@ -62,22 +62,22 @@ use std::path::PathBuf;
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 19872;
+const SLAB_LEN: usize = 23672;
 
 #[cfg(feature = "small")]
 const MAX_ACCOUNTS: usize = 256;
 #[cfg(feature = "small")]
-const SLAB_LEN: usize = 94400;
+const SLAB_LEN: usize = 108952;
 
 #[cfg(feature = "medium")]
 const MAX_ACCOUNTS: usize = 1024;
 #[cfg(feature = "medium")]
-const SLAB_LEN: usize = 372512;
+const SLAB_LEN: usize = 430072;
 
 #[cfg(not(any(feature = "test", feature = "small", feature = "medium")))]
 const MAX_ACCOUNTS: usize = 4096;
 #[cfg(not(any(feature = "test", feature = "small", feature = "medium")))]
-const SLAB_LEN: usize = 1484960;
+const SLAB_LEN: usize = 1714552;
 
 const ACCOUNTS_PER_CRANK: u16 = 128;
 // Keep this in sync with `percolator::LIQ_BUDGET_PER_CRANK`.

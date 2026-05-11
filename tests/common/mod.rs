@@ -65,7 +65,7 @@ pub const SLAB_LEN: usize = 96_760;
 pub const MAX_ACCOUNTS: usize = 256;
 
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
-pub const SLAB_LEN: usize = 1_525_912;
+pub const SLAB_LEN: usize = 1_755_504;
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const MAX_ACCOUNTS: usize = 4096;
 
@@ -110,13 +110,13 @@ pub const ENGINE_NUM_USED_OFFSET: usize = 592;
 // with MAX_ACCOUNTS. small probed at engine+17632; medium/default need
 // their own probe before the offset-dependent tests run on those tiers.
 #[cfg(all(feature = "small", not(feature = "medium")))]
-pub const ENGINE_ACCOUNTS_OFFSET: usize = 17840;
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 18056;
 
 #[cfg(all(feature = "medium", not(feature = "small")))]
-pub const ENGINE_ACCOUNTS_OFFSET: usize = 17840;
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 18056;
 
 #[cfg(not(any(feature = "small", feature = "medium")))]
-pub const ENGINE_ACCOUNTS_OFFSET: usize = 17840;
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 18056;
 
 // Pyth Receiver program ID
 pub const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
@@ -2312,8 +2312,8 @@ impl TestEnv {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 584, accounts array at offset 9424 within RiskEngine
         // Account size = 368 bytes, capital at offset 0 within Account
-        pub const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        pub const ACCOUNT_SIZE: usize = 360;
+        pub const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        pub const ACCOUNT_SIZE: usize = 416;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0; // After account_id (u64)
         let account_offset =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
@@ -2340,8 +2340,8 @@ impl TestEnv {
         //   accounts table at engine+17632 (was +9424)
         //   account stride 360 (was 352).
         pub const ENGINE: usize = 584;
-        pub const ACCOUNTS_OFFSET: usize = ENGINE + 17840;
-        pub const ACCOUNT_SIZE: usize = 360;
+        pub const ACCOUNTS_OFFSET: usize = ENGINE + 18056;
+        pub const ACCOUNT_SIZE: usize = 416;
         pub const PBQ: usize = 56;       // position_basis_q: i128 (16 bytes)
         pub const A_BASIS: usize = 72;   // adl_a_basis: u128 (16 bytes)
         pub const EPOCH_SNAP: usize = 120; // adl_epoch_snap: u64 (8 bytes)
@@ -4526,8 +4526,8 @@ impl TradeCpiTestEnv {
         let d = self.svm.get_account(&self.slab).unwrap().data;
         // v12.19: see read_account_position above for offset rationale.
         pub const ENGINE: usize = 584;
-        pub const ACCOUNTS_OFFSET: usize = ENGINE + 17840;
-        pub const ACCOUNT_SIZE: usize = 360;
+        pub const ACCOUNTS_OFFSET: usize = ENGINE + 18056;
+        pub const ACCOUNT_SIZE: usize = 416;
         pub const PBQ: usize = 56;
         pub const A_BASIS: usize = 72;
         pub const EPOCH_SNAP: usize = 120;
@@ -4679,8 +4679,8 @@ impl TradeCpiTestEnv {
         //   pnl: i128 (16), offset 24
         //   reserved_pnl: u128 (16), offset 40
         //   position_basis_q: i128 (16), offset 56
-        pub const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        pub const ACCOUNT_SIZE: usize = 360;
+        pub const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        pub const ACCOUNT_SIZE: usize = 416;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24;
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
@@ -4862,8 +4862,8 @@ impl TradeCpiTestEnv {
 
     pub fn read_account_capital(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        pub const ACCOUNT_SIZE: usize = 360;
+        pub const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        pub const ACCOUNT_SIZE: usize = 416;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0;
         let account_off =
             ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + CAPITAL_OFFSET_IN_ACCOUNT;
@@ -5102,8 +5102,8 @@ impl TestEnv {
     /// Read account PnL for a slot
     pub fn read_account_pnl(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        pub const ACCOUNT_SIZE: usize = 360;
+        pub const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        pub const ACCOUNT_SIZE: usize = 416;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24; // BPF: i128 has 8-byte alignment
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
         if slab_data.len() < account_off + 16 {
@@ -5758,8 +5758,8 @@ impl TestEnv {
     /// Fee credits is at offset 224 within Account.
     pub fn read_account_fee_credits(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        const ACCOUNT_SIZE: usize = 360;
+        const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        const ACCOUNT_SIZE: usize = 416;
         const FEE_CREDITS_OFFSET: usize = 224;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
         if slab_data.len() < off + 16 {
@@ -5773,8 +5773,8 @@ impl TestEnv {
     /// warmup_started_at_slot is at offset 64 within Account.
     pub fn read_account_warmup_started_at_slot(&self, idx: u16) -> u64 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        const ACCOUNT_SIZE: usize = 360;
+        const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        const ACCOUNT_SIZE: usize = 416;
         const WARMUP_SLOT_OFFSET: usize = 64;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + WARMUP_SLOT_OFFSET;
         if slab_data.len() < off + 8 {
@@ -5787,8 +5787,8 @@ impl TestEnv {
     /// reserved_pnl is at offset 48 within Account.
     pub fn read_account_reserved_pnl(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        const ACCOUNT_SIZE: usize = 360;
+        const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        const ACCOUNT_SIZE: usize = 416;
         const RESERVED_PNL_OFFSET: usize = 40;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + RESERVED_PNL_OFFSET;
         if slab_data.len() < off + 16 {
@@ -5803,8 +5803,8 @@ impl TestEnv {
     ///   kind: u8 at offset 16
     pub fn read_account_kind(&self, idx: u16) -> u8 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        const ACCOUNT_SIZE: usize = 360;
+        const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        const ACCOUNT_SIZE: usize = 416;
         const KIND_OFFSET: usize = 16;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + KIND_OFFSET;
         if slab_data.len() < off + 1 {
@@ -5817,8 +5817,8 @@ impl TestEnv {
     /// matcher_program is at offset 128 within Account (BPF layout).
     pub fn read_account_matcher_program(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        const ACCOUNT_SIZE: usize = 360;
+        const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        const ACCOUNT_SIZE: usize = 416;
         const MATCHER_PROG_OFFSET: usize = 128;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_PROG_OFFSET;
         let mut buf = [0u8; 32];
@@ -5830,8 +5830,8 @@ impl TestEnv {
     /// matcher_context is at offset 160 within Account (BPF layout).
     pub fn read_account_matcher_context(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 584 + 17840;
-        const ACCOUNT_SIZE: usize = 360;
+        const ACCOUNTS_OFFSET: usize = 584 + 18056;
+        const ACCOUNT_SIZE: usize = 416;
         const MATCHER_CTX_OFFSET: usize = 160;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_CTX_OFFSET;
         let mut buf = [0u8; 32];

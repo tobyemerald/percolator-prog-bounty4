@@ -31,7 +31,7 @@ use std::path::PathBuf;
 // (engine PR #94 @ a67ff66d).
 // Wave 6a (engine PR #95): phantom-dust 4-field schema swap, +32
 // bytes. Cumulative +248 from pre-Wave-1.
-const SLAB_LEN: usize = 1484960; // MAX_ACCOUNTS=4096 + 32KB gen table + Phase A/E MarketConfig extension (+80)
+const SLAB_LEN: usize = 1714552; // MAX_ACCOUNTS=4096 + 32KB gen table + Phase A/E MarketConfig extension (+80)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -257,6 +257,12 @@ fn test_account_struct_alignment() {
         adl_k_snap: 0i128,
         f_snap: 0i128,
         adl_epoch_snap: 0u64,
+        // Wave 11a-i: B-tracking per-account fields (no writer on this
+        // branch; all zero).
+        loss_weight: 0u128,
+        b_snap: 0u128,
+        b_rem: 0u128,
+        b_epoch_snap: 0u64,
         matcher_program: [0xAA; 32],
         matcher_context: [0xBB; 32],
         owner: [0xCC; 32],
