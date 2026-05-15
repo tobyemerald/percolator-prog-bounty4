@@ -273,6 +273,12 @@ pub mod constants {
     pub const MATCHER_CONTEXT_LEN: usize = 320;
     pub const MATCHER_CALL_TAG: u8 = 0;
     pub const MATCHER_CALL_LEN: usize = 67;
+    /// Wave 12-C (port of upstream 5229c1c): maximum variadic accounts
+    /// forwarded by TradeCpi to the matcher. Transaction account limits
+    /// are an outer bound; this protocol cap keeps wrapper heap/CU and
+    /// matcher ABI expectations explicit, and prevents an attacker from
+    /// padding the tail to exhaust CU before the matcher can decide.
+    pub const MAX_MATCHER_TAIL_ACCOUNTS: usize = 32;
 
     /// Sentinel value for permissionless crank (no caller account required)
     pub const CRANK_NO_CALLER: u16 = u16::MAX;
@@ -1478,7 +1484,15 @@ pub mod matcher_abi {
             if (ret.flags & FLAG_PARTIAL_OK) == 0 {
                 return Err(ProgramError::InvalidAccountData);
             }
-            // Zero fill with PARTIAL_OK is allowed - return early
+            // Zero-fill carries no executable price. Require the matcher to
+            // echo the request oracle as the canonical no-op price so callers,
+            // indexers, and future wrapper code never ingest adversarial
+            // off-market `exec_price_e6` values from a no-fill response.
+            // (Wave 12-C, port of upstream 9c8daa4.)
+            if ret.exec_price_e6 != oracle_price_e6 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            // Canonical zero fill with PARTIAL_OK is allowed - return early
             return Ok(());
         }
 
@@ -9148,11 +9162,24 @@ pub mod processor {
         } else {
             engine.oracle_target_price_e6
         };
+        // Wave 12-C (port of upstream d76ea67): same-slot duplicate cranks
+        // are valid keeper traffic, but they do not prove a positive-time
+        // price step is impossible. Passing the still-pending raw target to
+        // the engine's P-last recovery gate when dt==0 can make a healthy
+        // exposed market satisfy BelowProgressFloor solely because no
+        // additional slot elapsed. Keep ordinary keeper/touch progress
+        // enabled, but withhold raw-target recovery evidence until a real
+        // bounded segment exists.
+        let authenticated_recovery_target = if clock.slot > engine.last_market_slot {
+            raw_target
+        } else {
+            engine.last_oracle_price
+        };
         let progress_outcome = engine
             .permissionless_progress_not_atomic(percolator::PermissionlessProgressRequest {
                 now_slot: clock.slot,
                 oracle_price: price,
-                authenticated_raw_target_price: raw_target,
+                authenticated_raw_target_price: authenticated_recovery_target,
                 ordered_candidates: &candidates,
                 account_hint,
                 max_revalidations: crate::constants::LIQ_BUDGET_PER_CRANK,
@@ -9471,6 +9498,15 @@ pub mod processor {
         let a_matcher_prog = &accounts[5];
         let a_matcher_ctx = &accounts[6];
         let a_lp_pda = &accounts[7];
+        // Wave 12-C (port of upstream 5229c1c): cap matcher tail length so
+        // an attacker cannot pad accounts to exhaust CU before the matcher
+        // can reject. Solana's tx account-count limit is the outer bound;
+        // this protocol cap keeps wrapper heap/CU and matcher ABI explicit.
+        if accounts.len() > 8
+            && accounts.len() - 8 > crate::constants::MAX_MATCHER_TAIL_ACCOUNTS
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
 
         accounts::expect_signer(a_user)?;
         // Note: a_lp_owner does NOT need to be a signer for TradeCpi.
@@ -9935,12 +9971,18 @@ pub mod processor {
                     fee_paid_cpi,
                     config.mark_min_fee,
                 );
-                if full_weight_observation {
+                // Wave 12-C (port of upstream 397be0d): only full-weight
+                // observations that ACTUALLY MOVE the EWMA advance its clock.
+                // Sub-threshold fills and same-price wash trades can mutate /
+                // pay as configured, but they do not reset the EWMA clock —
+                // otherwise a controlled matcher can pin future alpha by
+                // repeatedly trading at the old mark for only the base fee.
+                let trade_mark_moved_cpi = config.mark_ewma_e6 != old_ewma_cpi;
+                if full_weight_observation && trade_mark_moved_cpi {
                     config.mark_ewma_last_slot = clock.slot;
                 }
                 // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
                 // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
-            }
 
             // Hyperp: also update authority_price (legacy mark field)
             if is_hyperp {
@@ -9952,6 +9994,9 @@ pub mod processor {
                 // PORT-3d (CRITICAL-4 sub-hunk 4): full-weight gate on
                 // last_mark_push_slot — without it, dust trades refresh
                 // Hyperp's permissionless-stale-maturity gate too.
+                // Wave 12-C: ALSO requires actual EWMA movement to defeat
+                // same-price wash pinning of the Hyperp permissionless-stale
+                // gate.
                 let fee_paid_hyperp = if config.mark_min_fee > 0 {
                     let ins_after_cpi = engine.insurance_fund.balance.get();
                     let delta = ins_after_cpi
@@ -9963,9 +10008,10 @@ pub mod processor {
                 };
                 let full_weight_hyperp =
                     config.mark_min_fee == 0 || fee_paid_hyperp >= config.mark_min_fee;
-                if full_weight_hyperp {
+                if full_weight_hyperp && trade_mark_moved_cpi {
                     config.last_mark_push_slot = clock.slot as u128;
                 }
+            }
             }
         }
         // Engine borrow dropped. Write nonce + config.
