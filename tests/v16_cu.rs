@@ -1036,6 +1036,7 @@ impl V16CuEnv {
                             size_q: 10 * POS_SCALE,
                             exec_price: 100,
                             fee_bps: 0,
+                            admit_h_max_consumption_threshold_bps_opt: None,
                         },
                     )
                     .unwrap();
@@ -1080,6 +1081,7 @@ impl V16CuEnv {
                             size_q: 10 * POS_SCALE,
                             exec_price: 100,
                             fee_bps: 0,
+                            admit_h_max_consumption_threshold_bps_opt: None,
                         },
                     )
                     .unwrap();

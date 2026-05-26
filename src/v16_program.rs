@@ -4979,6 +4979,11 @@ pub mod processor {
                 size_q: size_abs,
                 exec_price,
                 fee_bps,
+                // A-1 baseline: pass None so wrapper trade path is byte-identical
+                // to upstream v16 behavior. Fork bundles that need the
+                // admit-threshold ratchet (cf. V16_DIVERGENCES.md A-1) wire it
+                // from instruction args in Phase 2.B.
+                admit_h_max_consumption_threshold_bps_opt: None,
             };
             let backing_before = if cfg.backing_trade_fee_policy_count == 0 {
                 None
@@ -5263,6 +5268,9 @@ pub mod processor {
             size_q: close_q,
             exec_price: frozen_mark,
             fee_bps: 0,
+            // A-1 baseline (offsetting close-pair path): None preserves upstream
+            // v16 semantics. Fork bundles wire this through in Phase 2.B.
+            admit_h_max_consumption_threshold_bps_opt: None,
         };
         if leg_a.side == SideV16::Short {
             group

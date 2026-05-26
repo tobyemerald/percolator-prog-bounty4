@@ -50,13 +50,18 @@ pinocchio = "0.6"
 arrayref = "0.3"
 num-derive = "0.4"
 num-traits = "0.2"
-percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "8e0e3f858fa07b44434d1ff2e4630266432cdb21" }
+# Local path to our v16-synced engine (../percolator at v16-sync branch).
+# Tracks our fork's audited engine state: upstream/master @89f25ce baseline
+# + 5 fork feature ports (A-1/A-4/A-6/A-9/A-10) + 39 fork-port Kani harnesses
+# + rolling-tip refresh through b757c76. See ../wrapper-engine-deep-audit/
+# V16_DIVERGENCES.md for full fork-divergence audit log.
+percolator = { path = "../percolator" }
 anchor-lang-v2 = { git = "https://github.com/solana-foundation/anchor", rev = "e3cf760826fa0a60f247635ea0572e59861ec9b5", package = "anchor-lang-v2", default-features = false, features = ["alloc", "guardrails"], optional = true }
 
 [target.'cfg(not(target_os = "solana"))'.dependencies]
 # Host tests still use owned snapshot helpers. The SBF/program target remains
 # on the engine's zero-copy account/view API and does not enable this feature.
-percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "8e0e3f858fa07b44434d1ff2e4630266432cdb21", features = ["runtime-vec-api"] }
+percolator = { path = "../percolator", features = ["runtime-vec-api"] }
 
 [dev-dependencies]
 bincode = "1"
