@@ -4,34 +4,31 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("sbf", "bpf"))', 'cfg(kani)', 'cfg(target_os, values("solana"))', 'cfg(feature, values("custom-heap", "custom-panic"))'] }
-
 [lib]
 crate-type = ["cdylib", "lib"]
 name = "percolator_prog"
-path = "src/percolator.rs"
+path = "src/v16_program.rs"
 
 [features]
+# v16 deploys through the Anchor v2 / Pinocchio entrypoint by default. The
+# Solana 1.18 bundled SBF toolchain cannot parse the current Anchor v2
+# dependency graph; use platform-tools v1.52 or newer for deployable builds.
+# `--no-default-features` remains available for legacy local compatibility.
+default = ["anchor-v2"]
 no-entrypoint = []
-test = []      # Enables local test-only CPI/oracle bypasses. Never combine with mainnet.
-test-sbf = ["test"]
-kani = []
+test-sbf = []
 cu-audit = []  # Enable compute unit checkpoints for CU auditing
-small = ["percolator/small"]    # MAX_ACCOUNTS=256 (~0.68 SOL)
-medium = ["percolator/medium"]  # MAX_ACCOUNTS=1024 (~2.7 SOL)
-mainnet = []                    # Mainnet build — enables compile-time guards
-# Wave 12-D: opt-in Anchor v2 / Pinocchio entrypoint (port of upstream eefe834).
-# Mutually exclusive with the legacy entrypoint via cfg gates in src/percolator.rs.
-# Mainnet binary should ship WITHOUT this feature (default = legacy entrypoint)
-# until a coordinated cutover with SDK + keeper consumers.
+kani = []
 anchor-v2 = ["dep:anchor-lang-v2"]
+# v16 is account-local and has no slab-wide account-count tier. These
+# feature names are no-ops so old local commands continue to build without
+# changing the deployed code shape.
+small = []
+medium = []
 
 [dependencies]
 solana-program = "1.18"
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
-spl-token-2022 = { version = "1.0", features = ["no-entrypoint"] }
-spl-token-metadata-interface = { version = "0.2" }
 thiserror = "1.0"
 bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
 pyth-sdk-solana = "0.10"
@@ -53,24 +50,18 @@ pinocchio = "0.6"
 arrayref = "0.3"
 num-derive = "0.4"
 num-traits = "0.2"
-percolator = { path = "../percolator" }
-serde_json = "1"
-# Wave 12-D: optional Anchor v2 / Pinocchio runtime (port of upstream eefe834).
-# Only pulled in when `--features anchor-v2` is set; the default build keeps
-# the legacy `solana_program::entrypoint!` and never compiles this dependency.
+percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "8e0e3f858fa07b44434d1ff2e4630266432cdb21" }
 anchor-lang-v2 = { git = "https://github.com/solana-foundation/anchor", rev = "e3cf760826fa0a60f247635ea0572e59861ec9b5", package = "anchor-lang-v2", default-features = false, features = ["alloc", "guardrails"], optional = true }
 
-[profile.release]
-overflow-checks = true
-lto = "fat"
-codegen-units = 1
-opt-level = "z"
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+# Host tests still use owned snapshot helpers. The SBF/program target remains
+# on the engine's zero-copy account/view API and does not enable this feature.
+percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "8e0e3f858fa07b44434d1ff2e4630266432cdb21", features = ["runtime-vec-api"] }
 
 [dev-dependencies]
 bincode = "1"
 solana-sdk = "1.18"
 solana-client = "1.18"
-solana-program-runtime = "1.18"
 rand = "0.8"
 rand_xorshift = "0.3"
 proptest = "1.4"
@@ -78,3 +69,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serial_test = "3"
 litesvm = "0.1"
 shellexpand = "3"
+serde_json = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(kani)',
+    'cfg(target_os, values("solana"))',
+    'cfg(feature, values("custom-heap", "custom-panic", "idl-build"))',
+] }
