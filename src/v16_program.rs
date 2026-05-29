@@ -139,6 +139,32 @@ pub mod constants {
     pub const TAG_LP_VAULT_CRANK_FEES: u8 = 69;
     pub const TAG_SET_LP_VAULT_PAUSED: u8 = 70;
     pub const TAG_CLOSE_LP_VAULT: u8 = 71;
+
+    // ── Fork NFT / B-3 TransferPortfolioOwnership (Phase 2.B Tier 3 / A.4) ─
+    // Tags 72-73 are the first block after LP Vault's 65-71.
+    pub const KIND_NFT_REGISTRY: u8 = 7;
+
+    /// Per-market NFT-program-id registry.
+    /// PDA seeds: `["nft_registry", market_group]`.
+    pub const NFT_REGISTRY_SEED: &[u8] = b"nft_registry";
+    pub const NFT_REGISTRY_VERSION: u8 = 1;
+
+    /// SHARED SEED CONTRACT with the percolator-nft program — that program
+    /// signs B-3 with `find_program_address([NFT_MINT_AUTHORITY_SEED],
+    /// nft_program_id)`.  If the NFT program's mint-authority seed ever
+    /// changes, this derivation + the B-3 signer check silently break;
+    /// the cross-ref comment and the derived-PDA test in
+    /// `tests/v16_fork_b3_nft_cpi.rs` are the guard.  See
+    /// `percolator-nft/src/state_v16.rs MINT_AUTHORITY_SEED`.
+    pub const NFT_MINT_AUTHORITY_SEED: &[u8] = b"mint_authority";
+
+    /// B-3 TransferPortfolioOwnership: tag 72.
+    /// Wire: tag(72) + new_owner[32] + asset_index(2 LE).
+    pub const TAG_TRANSFER_PORTFOLIO_OWNERSHIP: u8 = 72;
+
+    /// SetNftProgramId: tag 73.
+    /// Wire: tag(73) + nft_program_id[32].
+    pub const TAG_SET_NFT_PROGRAM_ID: u8 = 73;
 }
 
 pub mod error {
@@ -192,6 +218,14 @@ pub mod error {
         LpVaultSupplyMismatch,       // Custom(39)
         LpVaultAuthorityMismatch,    // Custom(40)
         LpVaultZeroSharesMinted,     // Custom(41) — Note 1 round-to-zero reject
+        // ── Fork NFT / B-3 TransferPortfolioOwnership (Phase 2.B Tier 3 / A.4)
+        // Appended after LP Vault variants so existing codes 0-41 are unshifted.
+        // Actual Custom() codes: 42-46 in enum order below.
+        NftRegistryNotFound,         // Custom(42) — registry uninitialized for this market
+        NftPortfolioNotTransferable, // Custom(43) — leg gating: locked/stale/closed/mid-close
+        NftTransferSelfOrZero,       // Custom(44) — new_owner == current or zero
+        NftInvalidMintAuthority,     // Custom(45) — signer != derive_nft_mint_authority(reg)
+        NftPortfolioProvenance,      // Custom(46) — layout/version/provenance mismatch
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -224,11 +258,13 @@ pub mod state {
         constants::{
             ASSET_ORACLE_PROFILE_LEN, ASSET_ORACLE_WRAPPER_LEN, HEADER_LEN,
             KIND_BACKING_DOMAIN_LEDGER, KIND_INSURANCE_LEDGER, KIND_LP_REDEMPTION,
-            KIND_LP_VAULT_REGISTRY, KIND_MARKET, KIND_PORTFOLIO, LP_VAULT_VERSION, MAGIC,
-            MARKET_GROUP_LEN, MARKET_GROUP_OFF, MIN_MARKET_ACCOUNT_LEN, ORACLE_LEG_CAP,
-            ORACLE_LEG_FLAGS_MASK, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
-            ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN,
-            PORTFOLIO_SOURCE_DOMAIN_LEN, PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
+            KIND_LP_VAULT_REGISTRY, KIND_MARKET, KIND_NFT_REGISTRY, KIND_PORTFOLIO,
+            LP_VAULT_VERSION, MAGIC, MARKET_GROUP_LEN, MARKET_GROUP_OFF,
+            MIN_MARKET_ACCOUNT_LEN, NFT_MINT_AUTHORITY_SEED, NFT_REGISTRY_SEED,
+            NFT_REGISTRY_VERSION, ORACLE_LEG_CAP, ORACLE_LEG_FLAGS_MASK,
+            ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK, ORACLE_MODE_HYBRID_AFTER_HOURS,
+            ORACLE_MODE_MANUAL, PORTFOLIO_ACCOUNT_LEN, PORTFOLIO_SOURCE_DOMAIN_LEN,
+            PORTFOLIO_STATE_LEN, VERSION, WRAPPER_CONFIG_LEN,
         },
         error::PercolatorError,
     };
@@ -813,6 +849,128 @@ pub mod state {
         // Zero the 8-byte MAGIC; check_header then fails NotInitialized.
         data[0..8].fill(0);
         Ok(())
+    }
+
+    // ── Fork NFT / B-3 TransferPortfolioOwnership (Phase 2.B Tier 3 / A.4) ─
+    //
+    // `NftRegistryV16` is a per-market PDA (seeds `["nft_registry",
+    // market_group]`) that stores which NFT program ID is authorised to invoke
+    // `TransferPortfolioOwnership` for portfolios in that market.  It mirrors
+    // the `LpVaultRegistryV16` admin pattern exactly: a single admin-gated
+    // `SetNftProgramId` instruction creates-or-updates the registry, and B-3
+    // reads it with FAIL-CLOSED semantics (uninitialized = reject).
+    //
+    // Design: nft_design.md §7 / §7.0 — confirmed fits, no improvisation.
+
+    /// Per-market NFT-program registry.  Size 72 bytes.
+    ///
+    /// Stored as `[HEADER_LEN=16][NftRegistryV16 POD=72]`.
+    ///
+    /// All fields are align-1 so the byte image is identical on host and SBF
+    /// (same discipline as `BackingDomainLedgerAccountV16`).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct NftRegistryV16 {
+        pub market_group: [u8; 32],   // 0..32
+        pub nft_program_id: [u8; 32], // 32..64
+        pub version: u8,              // 64
+        pub bump: u8,                 // 65
+        pub _padding: [u8; 6],        // 66..72
+    }
+
+    const _: () = assert!(core::mem::size_of::<NftRegistryV16>() == 72);
+
+    pub const fn nft_registry_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<NftRegistryV16>()
+    }
+
+    #[inline]
+    fn validate_nft_registry(reg: &NftRegistryV16) -> Result<(), ProgramError> {
+        if reg.market_group == [0u8; 32]
+            || reg.nft_program_id == [0u8; 32]
+            || reg.version != NFT_REGISTRY_VERSION
+            || reg._padding != [0u8; 6]
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    /// Read+validate the NftRegistryV16 from account data.
+    ///
+    /// FAIL-CLOSED gate: an uninitialized account (MAGIC absent) fails
+    /// `check_header` with `NotInitialized` before any NFT-related logic runs.
+    /// Never returns Ok for an account that was not written by
+    /// `init_nft_registry`.
+    #[inline]
+    pub fn read_nft_registry(data: &[u8]) -> Result<NftRegistryV16, ProgramError> {
+        if data.len() < nft_registry_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, KIND_NFT_REGISTRY)?; // FAIL-CLOSED
+        let bytes = data
+            .get(HEADER_LEN..nft_registry_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let reg = bytemuck::pod_read_unaligned(bytes);
+        validate_nft_registry(&reg)?;
+        Ok(reg)
+    }
+
+    #[inline]
+    pub fn write_nft_registry(
+        data: &mut [u8],
+        reg: &NftRegistryV16,
+    ) -> Result<(), ProgramError> {
+        if data.len() < nft_registry_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, KIND_NFT_REGISTRY)?;
+        validate_nft_registry(reg)?;
+        data.get_mut(HEADER_LEN..nft_registry_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(reg));
+        Ok(())
+    }
+
+    #[inline]
+    pub fn init_nft_registry(
+        data: &mut [u8],
+        reg: &NftRegistryV16,
+    ) -> Result<(), ProgramError> {
+        if data.len() < nft_registry_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+        write_header(data, KIND_NFT_REGISTRY)?;
+        write_nft_registry(data, reg)
+    }
+
+    /// NFT Registry PDA: `["nft_registry", market_group]`.
+    pub fn derive_nft_registry(program_id: &Pubkey, market_group: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[NFT_REGISTRY_SEED, market_group.as_ref()],
+            program_id,
+        )
+    }
+
+    /// NFT mint-authority PDA: `["mint_authority", nft_program_id]` — i.e.
+    /// `find_program_address([NFT_MINT_AUTHORITY_SEED], nft_program_id)`.
+    ///
+    /// SHARED CONTRACT with the percolator-nft program: the NFT program signs
+    /// B-3 CPI with `invoke_signed([NFT_MINT_AUTHORITY_SEED, &[bump]])` using
+    /// this PDA. A valid signer is cryptographic proof the call came from
+    /// `nft_program_id` (a program can only sign its own PDAs via
+    /// `invoke_signed`). See `constants::NFT_MINT_AUTHORITY_SEED`.
+    pub fn derive_nft_mint_authority(nft_program_id: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[NFT_MINT_AUTHORITY_SEED],
+            nft_program_id,
+        )
     }
 
     #[inline]
@@ -1445,7 +1603,7 @@ pub mod state {
     }
 
     #[inline]
-    fn portfolio_wire(data: &[u8]) -> Result<&PortfolioAccountV16Account, ProgramError> {
+    pub fn portfolio_wire(data: &[u8]) -> Result<&PortfolioAccountV16Account, ProgramError> {
         let bytes = data
             .get(HEADER_LEN..HEADER_LEN + core::mem::size_of::<PortfolioAccountV16Account>())
             .ok_or(PercolatorError::InvalidAccountLen)?;
@@ -1453,7 +1611,7 @@ pub mod state {
     }
 
     #[inline]
-    fn portfolio_wire_mut(
+    pub fn portfolio_wire_mut(
         data: &mut [u8],
     ) -> Result<&mut PortfolioAccountV16Account, ProgramError> {
         let bytes = data
@@ -2379,6 +2537,31 @@ pub mod ix {
             paused: u8,
         },
         CloseLpVault,
+        // ── Fork NFT / B-3 (Phase 2.B Tier 3 / A.4) — tags 72-73 ──────────
+        /// B-3 TransferPortfolioOwnership (tag 72).
+        ///
+        /// CPI-only: called by the NFT program's `ExecuteTransferHook` handler
+        /// with the mint-authority PDA as the signer.  Reassigns
+        /// `portfolio.owner` AND `portfolio.provenance_header.owner` atomically
+        /// (Guardrail 2 — dual write).  Guarded by all 6 §7 guardrails.
+        ///
+        /// Wire: `tag(72) + new_owner[32] + asset_index(2 LE)`.
+        TransferPortfolioOwnership {
+            new_owner: [u8; 32],
+            asset_index: u16,
+        },
+        /// SetNftProgramId (tag 73).
+        ///
+        /// Admin-gated.  Creates (or updates) the per-market `NftRegistryV16`
+        /// PDA with the authorised NFT program ID.  Must be run for a market
+        /// before NFT transfers work there.  Re-pointing is rare-and-deliberate;
+        /// it freezes in-flight transfers for NFTs minted under the old program
+        /// ID (no code change needed — fail-closed on mismatched signer).
+        ///
+        /// Wire: `tag(73) + nft_program_id[32]`.
+        SetNftProgramId {
+            nft_program_id: [u8; 32],
+        },
     }
 
     impl Instruction {
@@ -2621,6 +2804,15 @@ pub mod ix {
                     paused: read_u8(&mut rest)?,
                 },
                 71 => Self::CloseLpVault,
+                72 => {
+                    let new_owner = read_bytes32(&mut rest)?;
+                    let asset_index = read_u16(&mut rest)?;
+                    Self::TransferPortfolioOwnership { new_owner, asset_index }
+                }
+                73 => {
+                    let nft_program_id = read_bytes32(&mut rest)?;
+                    Self::SetNftProgramId { nft_program_id }
+                }
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -3030,6 +3222,15 @@ pub mod ix {
                 }
                 Self::CloseLpVault => {
                     out.push(71);
+                }
+                Self::TransferPortfolioOwnership { new_owner, asset_index } => {
+                    out.push(72);
+                    out.extend_from_slice(&new_owner);
+                    push_u16(&mut out, asset_index);
+                }
+                Self::SetNftProgramId { nft_program_id } => {
+                    out.push(73);
+                    out.extend_from_slice(&nft_program_id);
                 }
             }
             out
@@ -5037,6 +5238,12 @@ pub mod processor {
                 handle_set_lp_vault_paused(program_id, accounts, paused)
             }
             Instruction::CloseLpVault => handle_close_lp_vault(program_id, accounts),
+            Instruction::TransferPortfolioOwnership { new_owner, asset_index } => {
+                handle_transfer_portfolio_ownership(program_id, accounts, new_owner, asset_index)
+            }
+            Instruction::SetNftProgramId { nft_program_id } => {
+                handle_set_nft_program_id(program_id, accounts, nft_program_id)
+            }
         }
     }
 
@@ -6093,6 +6300,323 @@ pub mod processor {
             .lamports()
             .checked_add(reclaim)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok(())
+    }
+
+    // ── Fork NFT / B-3 (Phase 2.B Tier 3 / A.4) ─────────────────────────────
+    //
+    // SetNftProgramId (tag 73) + TransferPortfolioOwnership (tag 72).
+    //
+    // Security design: nft_design.md §7 and §7.0.  All 6 guardrails are
+    // implemented.  The fund-critical comment from the design doc is reproduced
+    // here for review-time visibility:
+    //
+    //   "TransferPortfolioOwnership reassigns control of a portfolio and
+    //    everything in it — under-gated = portfolio theft."
+    //
+    // Guardrail 5 (trust boundary) — DOCUMENTED HERE: the wrapper trusts the
+    // PDA-signing NFT program (proven via Guardrail 1) to have verified NFT
+    // holdership; the wrapper does NOT re-check holdership.
+    //
+    // Guardrail 6 (conservation, N/A) — DOCUMENTED HERE: owner-field rewrite
+    // only; zero token/stock/lien movement; portfolio value invariant.  All 4
+    // v16 conservation proofs are N/A:
+    //   - TokenValueFlowProofV16     N/A — no token transfer
+    //   - ReservationEncumbranceProof N/A — no encumbrance change
+    //   - StockReconciliation        N/A — no stock mutation
+    //   - SourceCreditLienAggregate  N/A — no lien change
+    //
+    // Cross-ref: NFT program `ExecuteTransferHook` is the CPI caller; see
+    // `percolator-nft/src/transfer_hook.rs handle_execute_transfer_hook`.
+
+    /// B-3 core: pure function operating on the portfolio POD.
+    ///
+    /// Implements Guardrails 2 (atomic dual-write), 3 (state gating),
+    /// 4 (no-op/self-transfer).  The handler performs Guardrail 1 (auth).
+    ///
+    /// Returns `Ok(())` and writes BOTH `p.owner` AND
+    /// `p.provenance_header.owner` to `new_owner` — or returns an `Err`
+    /// leaving the struct byte-identical to its input (Solana reverts all
+    /// mutations on instruction failure so the caller invariant also holds at
+    /// the account level).
+    ///
+    /// Unit tests in `tests/v16_fork_b3_nft_cpi.rs` assert that every
+    /// value-relevant field (legs, capital, pnl, reserved_pnl, close_progress,
+    /// health_cert, resolved_payout_receipt, …) is byte-identical before/after
+    /// a successful call — proving the "portfolio value unchanged across
+    /// transfer" conservation invariant.
+    pub fn b3_check_and_rewrite_owner(
+        p: &mut percolator::PortfolioAccountV16Account,
+        new_owner: [u8; 32],
+        asset_index: u16,
+    ) -> Result<(), ProgramError> {
+        use crate::error::PercolatorError;
+
+        // ── Guardrail 4 (no-op / self-transfer) ─────────────────────────────
+        if new_owner == [0u8; 32] {
+            return Err(PercolatorError::NftTransferSelfOrZero.into());
+        }
+        if new_owner == p.owner {
+            return Err(PercolatorError::NftTransferSelfOrZero.into());
+        }
+
+        // ── Guardrail 3 (state gating) ───────────────────────────────────────
+        // Find the active leg for asset_index.
+        let asset_index_u32 = asset_index as u32;
+        let leg_slot: Option<&percolator::PortfolioLegV16Account> = {
+            let mut found = None;
+            let mut i = 0usize;
+            while i < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+                let leg = &p.legs[i];
+                if leg.active != 0 && leg.asset_index.get() == asset_index_u32 {
+                    found = Some(leg);
+                    break;
+                }
+                i += 1;
+            }
+            found
+        };
+        let leg = leg_slot.ok_or(PercolatorError::NftPortfolioNotTransferable)?;
+
+        // Portfolio-level lock/stale gates.
+        if p.liquidation_lock != 0
+            || p.stale_state != 0
+            || p.b_stale_state != 0
+        {
+            return Err(PercolatorError::NftPortfolioNotTransferable.into());
+        }
+
+        // Resolved-payout receipt gate.
+        if p.resolved_payout_receipt.present != 0 {
+            return Err(PercolatorError::NftPortfolioNotTransferable.into());
+        }
+
+        // Mid-close gate: reject if a close is in progress for this asset.
+        if p.close_progress.active != 0
+            && p.close_progress.asset_index.get() == asset_index_u32
+        {
+            return Err(PercolatorError::NftPortfolioNotTransferable.into());
+        }
+
+        // Per-leg stale gates.
+        if leg.b_stale != 0 || leg.stale != 0 {
+            return Err(PercolatorError::NftPortfolioNotTransferable.into());
+        }
+
+        // ── Guardrail 2 (atomic dual-write) ──────────────────────────────────
+        // Write BOTH owner fields in the SAME mutation.  Any Err above leaves
+        // both fields untouched; we only reach here when all gates pass.
+        p.owner = new_owner;
+        p.provenance_header.owner = new_owner;
+
+        // Post-write assertion: both fields must match (guards against future
+        // re-ordering of the write lines above).
+        assert_eq!(
+            p.owner,
+            p.provenance_header.owner,
+            "b3: dual-write invariant violated"
+        );
+        assert_eq!(p.owner, new_owner, "b3: owner not written");
+
+        Ok(())
+    }
+
+    /// SetNftProgramId (tag 73) — creates or updates the per-market
+    /// `NftRegistryV16` PDA.
+    ///
+    /// Accounts:
+    ///   0  admin        [signer, writable] — pays rent on create
+    ///   1  market       [ro]               — source of cfg.admin + key for PDA
+    ///   2  nft_registry [writable, PDA]    — `["nft_registry", market.key]`
+    ///   3  system_program
+    ///
+    /// Guardrail: admin == cfg.admin; nft_program_id != [0;32].
+    ///
+    /// Re-pointing (updating an existing registry) is deliberate — a comment is
+    /// left noting that it freezes in-flight transfers for NFTs minted under the
+    /// old program ID.  No code needed for that: the fail-closed signer check
+    /// already rejects those CPIs after the update.
+    #[inline(never)]
+    fn handle_set_nft_program_id<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        nft_program_id: [u8; 32],
+    ) -> ProgramResult {
+        use crate::{constants, error::PercolatorError};
+
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let system_program_ai = account(accounts, 3)?;
+
+        expect_signer(admin)?;
+        expect_writable(admin)?;
+        expect_writable(registry_ai)?;
+        expect_owner(market_ai, program_id)?;
+
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if nft_program_id == [0u8; 32] {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+
+        // Verify admin authorization from market config.
+        let (cfg, _, _, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if admin.key.to_bytes() != cfg.admin {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        // Derive PDA and bind.
+        let (expected_pda, bump) =
+            state::derive_nft_registry(program_id, market_ai.key);
+        expect_key(registry_ai, &expected_pda)?;
+
+        if registry_ai.owner == &system_program::ID && registry_ai.data_is_empty() {
+            // CREATE path: account does not yet exist.
+            let registry_len = state::nft_registry_account_len();
+            let rent = Rent::get()?;
+            let market_bytes = market_ai.key.to_bytes();
+            invoke_signed(
+                &system_instruction::create_account(
+                    admin.key,
+                    registry_ai.key,
+                    rent.minimum_balance(registry_len),
+                    registry_len as u64,
+                    program_id,
+                ),
+                &[admin.clone(), registry_ai.clone(), system_program_ai.clone()],
+                &[&[
+                    constants::NFT_REGISTRY_SEED,
+                    market_bytes.as_ref(),
+                    &[bump],
+                ]],
+            )?;
+            let new_reg = state::NftRegistryV16 {
+                market_group: market_ai.key.to_bytes(),
+                nft_program_id,
+                version: constants::NFT_REGISTRY_VERSION,
+                bump,
+                _padding: [0u8; 6],
+            };
+            state::init_nft_registry(&mut registry_ai.try_borrow_mut_data()?, &new_reg)?;
+        } else {
+            // UPDATE path: registry already exists — re-point the nft_program_id.
+            // NOTE: updating the registry freezes in-flight NFT transfers for
+            // NFTs minted under the old program ID.  Those CPIs fail with
+            // NftInvalidMintAuthority (signer != derive_nft_mint_authority(new
+            // program_id)).  This is intentional: re-pointing is a deliberate
+            // admin action.
+            expect_owner(registry_ai, program_id)?;
+            let mut reg = state::read_nft_registry(&registry_ai.try_borrow_data()?)?;
+            // Bind the stored market_group to the account we just validated.
+            if reg.market_group != market_ai.key.to_bytes() {
+                return Err(PercolatorError::EngineProvenanceMismatch.into());
+            }
+            reg.nft_program_id = nft_program_id;
+            state::write_nft_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
+
+        Ok(())
+    }
+
+    /// B-3 TransferPortfolioOwnership (tag 72).
+    ///
+    /// CPI-ONLY — the NFT program's `ExecuteTransferHook` calls this with its
+    /// `mint_authority` PDA as the signer (cryptographic proof of NFT-program
+    /// identity).
+    ///
+    /// Accounts:
+    ///   0  mint_auth    [signer]           — NFT program's mint-authority PDA
+    ///   1  portfolio    [writable]         — portfolio being transferred
+    ///   2  nft_registry [ro, PDA]          — `["nft_registry", market_group]`
+    ///
+    /// All 6 §7 guardrails are implemented:
+    ///   1 Auth + registry FAIL-CLOSED (uninitialized registry = reject)
+    ///   2 Atomic dual-write (owner AND provenance_header.owner)
+    ///   3 State gating (active leg, no lock/stale/close/resolved)
+    ///   4 No-op/self-transfer rejection
+    ///   5 Trust boundary: wrapper trusts NFT program via Guardrail 1
+    ///   6 Conservation N/A — see module-level comment above
+    #[inline(never)]
+    fn handle_transfer_portfolio_ownership<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        new_owner: [u8; 32],
+        asset_index: u16,
+    ) -> ProgramResult {
+        use crate::error::PercolatorError;
+
+        let mint_auth_ai = account(accounts, 0)?;
+        let portfolio_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+
+        // ── Guardrail 1 (auth + registry, FAIL-CLOSED) ──────────────────────
+        expect_signer(mint_auth_ai)?;
+        expect_writable(portfolio_ai)?;
+        expect_owner(portfolio_ai, program_id)?;
+
+        // Validate portfolio header (KIND_PORTFOLIO + MAGIC + VERSION).
+        {
+            let data = portfolio_ai.try_borrow_data()?;
+            state::check_portfolio_kind(&data)?;
+        }
+
+        // Read portfolio POD to get market_group_id for registry binding.
+        let market_group_bytes: [u8; 32] = {
+            let data = portfolio_ai.try_borrow_data()?;
+            let wire = state::portfolio_wire(&data)?;
+            // Validate provenance header (checks layout_discriminator == 16 AND version == 1).
+            wire.provenance_header
+                .try_to_runtime()
+                .map_err(|_| PercolatorError::NftPortfolioProvenance)?;
+            // Verify anti-substitution anchor: portfolio account key == provenance id.
+            if wire.provenance_header.portfolio_account_id != portfolio_ai.key.to_bytes() {
+                return Err(PercolatorError::NftPortfolioProvenance.into());
+            }
+            wire.provenance_header.market_group_id
+        };
+
+        // Read NftRegistry — FAIL-CLOSED: uninitialized = NotInitialized error.
+        let market_group_key = Pubkey::new_from_array(market_group_bytes);
+        let (expected_registry_pda, _) =
+            state::derive_nft_registry(program_id, &market_group_key);
+        expect_key(registry_ai, &expected_registry_pda)?;
+        expect_owner(registry_ai, program_id)?;
+
+        let registry = state::read_nft_registry(&registry_ai.try_borrow_data()?)
+            .map_err(|_| PercolatorError::NftRegistryNotFound)?;
+
+        // Bind registry to this market.
+        if registry.market_group != market_group_bytes {
+            return Err(PercolatorError::NftRegistryNotFound.into());
+        }
+
+        // Derive expected mint-authority PDA from the registered NFT program.
+        let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
+        let (expected_mint_auth, _) =
+            state::derive_nft_mint_authority(&nft_program_id);
+        if mint_auth_ai.key != &expected_mint_auth {
+            return Err(PercolatorError::NftInvalidMintAuthority.into());
+        }
+        // Signer is already asserted above; this is the critical check:
+        // a valid signer proves the CPI came from `nft_program_id`.
+
+        // ── Guardrails 2/3/4 via pure function ──────────────────────────────
+        {
+            let mut data = portfolio_ai.try_borrow_mut_data()?;
+            let p = state::portfolio_wire_mut(&mut data)?;
+            b3_check_and_rewrite_owner(p, new_owner, asset_index)?;
+
+            // Post-write: assert invariant holds in the on-chain data bytes.
+            debug_assert_eq!(
+                p.owner,
+                p.provenance_header.owner,
+                "b3 handler: dual-write invariant violated"
+            );
+        }
+
         Ok(())
     }
 
