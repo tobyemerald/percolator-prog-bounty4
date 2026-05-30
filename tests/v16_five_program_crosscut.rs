@@ -65,6 +65,9 @@ const INVALID_TOKEN_PROGRAM: u32 = 13;
 /// market returns this (verified by diagnostic at 3A.0), proving the classic
 /// token program got PAST `verify_token_program`.
 const NOT_INITIALIZED: u32 = 3;
+/// `EngineLockActive` — ordinal 21. Market-state guard (e.g. flush/topup into a
+/// non-Live market; terminal-reclaim preconditions).
+const E_LOCK_ACTIVE: u32 = 21;
 
 // ── 3A.0-A: all five co-load executable + distinct token roles ──────────────
 
@@ -1435,6 +1438,327 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
     // LP-share mint nets to zero (minted on deposit, burned on redeem).
     let reg = state::read_lp_vault_registry(&env.account_data(env.lp_registry)).unwrap();
     assert_eq!(reg.total_lp_shares_outstanding, 0, "LP shares net to zero");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3A.3 — STAKE greenfield. percolator_stake.so is loaded by ZERO wrapper tests;
+// it CANNOT be a dev-dep here (zeroize/solana-2.2 clash), so the StakePool account
+// is HAND-CRAFTED (384 bytes) and the stake tags are HAND-ENCODED. The proven
+// wiring is lifted from percolator-stake/tests/v16_stake_insurance_e2e.rs (which
+// uses the real crate under litesvm 0.6). PoolV16 layout: state.rs:19-114,
+// STAKE_POOL_SIZE=384 (:515); discriminator "SPOOL_V1" @320..328, version 2 @328.
+// ════════════════════════════════════════════════════════════════════════════
+
+const STAKE_POOL_SIZE: usize = 384;
+const STAKE_POOL_DISCRIMINATOR: &[u8; 8] = b"SPOOL_V1";
+const STAKE_POOL_VERSION: u8 = 2;
+
+/// Hand-craft a v16 StakePool in insurance-LP mode (pool_mode=0), bound to
+/// `market` + `percolator_program`, with `vault` funded for flush. Mirrors the
+/// e2e's `StakePool::zeroed() + fields + set_discriminator` (e2e.rs:232-244) as
+/// raw bytes at the exact offsets.
+#[allow(clippy::too_many_arguments)]
+fn craft_stake_pool_bytes(
+    market: &Pubkey,
+    admin: &Pubkey,
+    collateral_mint: &Pubkey,
+    lp_mint: &Pubkey,
+    stake_vault: &Pubkey,
+    total_deposited: u64,
+    percolator_program: &Pubkey,
+    vault_authority_bump: u8,
+) -> Vec<u8> {
+    let mut d = vec![0u8; STAKE_POOL_SIZE];
+    d[0] = 1; // is_initialized
+    d[1] = 255; // pool bump (informational here)
+    d[2] = vault_authority_bump;
+    d[8..40].copy_from_slice(market.as_ref()); // slab (bound wrapper market)
+    d[40..72].copy_from_slice(admin.as_ref());
+    d[72..104].copy_from_slice(collateral_mint.as_ref());
+    d[104..136].copy_from_slice(lp_mint.as_ref());
+    d[136..168].copy_from_slice(stake_vault.as_ref()); // vault (source)
+    d[168..176].copy_from_slice(&total_deposited.to_le_bytes()); // available-for-flush
+    d[224..256].copy_from_slice(percolator_program.as_ref()); // CPI target (= MAINNET)
+    // d[280] pool_mode = 0 (insurance LP) — already zero.
+    d[320..328].copy_from_slice(STAKE_POOL_DISCRIMINATOR);
+    d[328] = STAKE_POOL_VERSION;
+    d
+}
+
+struct StakeCtx {
+    pool_pda: Pubkey,
+    vault_auth: Pubkey,
+    stake_vault: Pubkey,
+}
+
+impl CrosscutEnv {
+    /// Craft a stake pool bound to this market, fund its vault with `deposit`.
+    fn setup_stake_pool(&mut self, deposit: u64) -> StakeCtx {
+        let (pool_pda, _) =
+            Pubkey::find_program_address(&[b"stake_pool", self.market.as_ref()], &STAKE_ID);
+        let (vault_auth, vault_auth_bump) =
+            Pubkey::find_program_address(&[b"vault_auth", pool_pda.as_ref()], &STAKE_ID);
+        let stake_vault = Pubkey::new_unique();
+        // Stake vault token account: SPL owner = vault_auth PDA, mint = collateral.
+        self.svm
+            .set_account(
+                stake_vault,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, vault_auth, deposit),
+                    owner: spl_token_classic_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let lp_mint = Pubkey::new_unique();
+        let pool_bytes = craft_stake_pool_bytes(
+            &self.market,
+            &self.admin.pubkey(),
+            &self.mint,
+            &lp_mint,
+            &stake_vault,
+            deposit,
+            &self.program_id, // = MAINNET (must match the loaded wrapper)
+            vault_auth_bump,
+        );
+        self.svm
+            .set_account(
+                pool_pda,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: pool_bytes,
+                    owner: STAKE_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        StakeCtx {
+            pool_pda,
+            vault_auth,
+            stake_vault,
+        }
+    }
+
+    /// stake BindInsuranceAuthority (tag 19) — stake CPIs the wrapper's
+    /// UpdateAuthority(insurance) to set cfg.insurance_authority = vault_auth PDA.
+    fn stake_bind(&mut self, ctx: &StakeCtx) -> Result<(), TransactionError> {
+        let admin = self.admin.insecure_clone();
+        let ix = Instruction {
+            program_id: STAKE_ID,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(ctx.pool_pda, false),
+                AccountMeta::new_readonly(ctx.vault_auth, false),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new_readonly(self.program_id, false),
+            ],
+            data: vec![19u8],
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![ix], &[&admin])
+    }
+
+    /// Advance the SVM clock (ResolveMarket requires `clock_slot >= current_slot`).
+    fn warp(&mut self, slot: u64) {
+        self.svm.warp_to_slot(slot);
+    }
+
+    /// wrapper ResolveMarket — transitions the market mode Live -> resolved.
+    fn resolve_market(&mut self) -> Result<(), TransactionError> {
+        let admin = self.admin.insecure_clone();
+        self.try_wrapper(
+            ProgInstruction::ResolveMarket,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            &[&admin],
+        )
+    }
+
+    /// stake FlushToInsurance (tag 3 + u64) — stake CPIs the wrapper's
+    /// TopUpInsurance (invoke_signed by vault_auth), moving stake_vault ->
+    /// wrapper vault and crediting group.insurance.
+    fn stake_flush(&mut self, ctx: &StakeCtx, amount: u64) -> Result<(), TransactionError> {
+        let admin = self.admin.insecure_clone();
+        let mut data = vec![3u8];
+        data.extend_from_slice(&amount.to_le_bytes());
+        let ix = Instruction {
+            program_id: STAKE_ID,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(ctx.pool_pda, false),
+                AccountMeta::new(ctx.stake_vault, false),
+                AccountMeta::new_readonly(ctx.vault_auth, false),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.program_id, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+            ],
+            data,
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![ix], &[&admin])
+    }
+
+    /// stake RotateInsuranceAuthority (tag 20) — the no-lockout escape: stake CPIs
+    /// the wrapper's UpdateAuthority with the vault_auth PDA signing as the CURRENT
+    /// authority and `new_target` co-signing as the successor.
+    fn stake_rotate(&mut self, ctx: &StakeCtx, new_target: &Keypair) -> Result<(), TransactionError> {
+        let admin = self.admin.insecure_clone();
+        let ix = Instruction {
+            program_id: STAKE_ID,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(ctx.pool_pda, false),
+                AccountMeta::new_readonly(ctx.vault_auth, false),
+                AccountMeta::new_readonly(new_target.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new_readonly(self.program_id, false),
+            ],
+            data: vec![20u8],
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![ix], &[&admin, new_target])
+    }
+
+    /// wrapper WithdrawInsurance (tag 41 + u128) — terminal reclaim by the (now
+    /// signable) insurance authority. Returns (dest_token, result).
+    fn wrapper_withdraw_insurance(
+        &mut self,
+        authority: &Keypair,
+        amount: u128,
+    ) -> (Pubkey, Result<(), TransactionError>) {
+        let dest = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                dest,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, authority.pubkey(), 0),
+                    owner: spl_token_classic_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let mut data = vec![41u8];
+        data.extend_from_slice(&amount.to_le_bytes());
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(authority.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+            ],
+            data,
+        };
+        let res = send_ixs(&mut self.svm, &self.payer, vec![ix], &[authority]);
+        (dest, res)
+    }
+}
+
+/// 3A.3 (foundation) — the hand-crafted stake pool + hand-encoded bind/flush drive
+/// the loaded percolator_stake.so under litesvm 0.1: stake CPIs the wrapper at
+/// MAINNET to bind the insurance authority to its vault_auth PDA, then flushes
+/// collateral stake_vault -> wrapper vault and credits insurance. THE greenfield
+/// de-risk (stake was loaded by zero wrapper tests before now).
+#[test]
+fn x0_stake_flush_to_insurance_at_mainnet() {
+    let mut env = CrosscutEnv::new();
+    let flush_amount: u64 = 1_000_000;
+    let ctx = env.setup_stake_pool(flush_amount);
+
+    let insurance_before = env.group().insurance;
+    let vault_before = env.token_amount(env.vault);
+
+    // Bind must precede the first flush (TopUpInsurance is gated by
+    // cfg.insurance_authority == signer == vault_auth PDA).
+    env.stake_bind(&ctx).expect("BindInsuranceAuthority");
+    env.stake_flush(&ctx, flush_amount).expect("FlushToInsurance");
+
+    // Executed guards: real token movement + insurance credit through the CPI.
+    assert_eq!(env.token_amount(ctx.stake_vault), 0, "stake vault drained by flush");
+    assert_eq!(
+        env.token_amount(env.vault),
+        vault_before + flush_amount,
+        "wrapper vault received the flushed collateral"
+    );
+    assert_eq!(
+        env.group().insurance,
+        insurance_before + flush_amount as u128,
+        "group.insurance credited by exactly the flushed amount"
+    );
+}
+
+/// X2-FLUSH-RACE (part 1) — a flush into a RESOLVED market reverts mode!=Live
+/// (the wrapper's TopUpInsurance Live-gate, v16_program.rs:7566), atomically. Plus
+/// the flush-conservation invariant on the Live flush (insurance += exactly the
+/// flushed amount; vault conserved).
+#[test]
+fn x2_flush_race_resolved_market_reverts_mode_not_live() {
+    let mut env = CrosscutEnv::new();
+    let ctx = env.setup_stake_pool(2_000_000);
+    env.stake_bind(&ctx).expect("bind");
+
+    // Live flush — conservation.
+    let insurance_before = env.group().insurance;
+    let vault_before = env.token_amount(env.vault);
+    env.stake_flush(&ctx, 1_000_000).expect("flush while Live");
+    assert_eq!(env.group().insurance, insurance_before + 1_000_000, "insurance += exactly the flush");
+    assert_eq!(env.token_amount(env.vault), vault_before + 1_000_000, "vault conserved through flush");
+    assert_eq!(env.token_amount(ctx.stake_vault), 1_000_000, "stake vault retains the un-flushed 1M");
+
+    // Resolve, then a second flush must revert (mode != Live) and change NOTHING.
+    env.warp(100); // align SVM clock >= group.current_slot for ResolveMarket
+    env.resolve_market().expect("resolve market");
+    let insurance_pre = env.group().insurance;
+    let vault_pre = env.token_amount(env.vault);
+    let stake_pre = env.token_amount(ctx.stake_vault);
+    let res = env.stake_flush(&ctx, 1_000_000);
+    assert_custom(res, E_LOCK_ACTIVE, "flush into a resolved market reverts mode!=Live");
+    assert_eq!(env.group().insurance, insurance_pre, "rejected flush left insurance unchanged");
+    assert_eq!(env.token_amount(env.vault), vault_pre, "rejected flush left wrapper vault unchanged");
+    assert_eq!(env.token_amount(ctx.stake_vault), stake_pre, "rejected flush left stake vault unchanged");
+}
+
+/// X5-TERMINAL — terminal-reclaim LIVENESS + no-lockout. After a stake flush
+/// (insurance credited to asset-0's domain budgets, authority = vault_auth PDA),
+/// the insurance would be stranded because a PDA can't sign WithdrawInsurance.
+/// The escape is RotateInsuranceAuthority(20): rotate the authority off the PDA to
+/// a signable wallet, resolve, then that wallet reclaims EXACTLY the flushed
+/// insurance. This is the highest-value gate check: does terminal-reclaim liveness
+/// hold in the assembled system?
+#[test]
+fn x5_terminal_reclaim_liveness_via_rotate_no_lockout() {
+    let mut env = CrosscutEnv::new();
+    let amount: u64 = 1_000_000;
+    let ctx = env.setup_stake_pool(amount);
+    env.stake_bind(&ctx).expect("bind");
+    env.stake_flush(&ctx, amount).expect("flush");
+    assert_eq!(env.group().insurance, amount as u128, "insurance funded by flush");
+    assert_eq!(env.token_amount(env.vault), amount, "wrapper vault holds the flushed collateral");
+
+    // No-lockout escape: rotate the insurance authority off the vault_auth PDA to a
+    // signable wallet BEFORE decommission (must be done while Live).
+    let reclaim_authority = Keypair::new();
+    env.svm.airdrop(&reclaim_authority.pubkey(), 1_000_000_000).unwrap();
+    env.stake_rotate(&ctx, &reclaim_authority)
+        .expect("rotate insurance authority off the PDA (no-lockout)");
+
+    // Resolve (mode -> resolved). Market has count==0 && c_tot==0 (no portfolios).
+    env.warp(100);
+    env.resolve_market().expect("resolve");
+
+    // Terminal reclaim: the rotated authority withdraws the flushed insurance.
+    let (dest, res) = env.wrapper_withdraw_insurance(&reclaim_authority, amount as u128);
+    res.expect("terminal WithdrawInsurance must succeed (reclaim liveness holds, no lockout)");
+    assert_eq!(env.token_amount(dest), amount, "reclaimed EXACTLY the flushed insurance");
+    assert_eq!(env.token_amount(env.vault), 0, "wrapper vault drained by terminal reclaim");
+    assert_eq!(env.group().insurance, 0, "insurance fully reclaimed");
 }
 
 /// 3A.1b — a real matcher `TradeCpi` fires through the loaded `percolator_match`
