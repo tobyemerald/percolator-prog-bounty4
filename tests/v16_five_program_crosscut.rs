@@ -71,6 +71,12 @@ const E_LOCK_ACTIVE: u32 = 21;
 /// NFT `TransferBlocked` = Custom(24) — the transfer-hook's `transfer_gate_check`
 /// rejecting a locked/stale/resolved portfolio (fires before B-3).
 const NFT_TRANSFER_BLOCKED: u32 = 24;
+/// `NftInvalidMintAuthority` = Custom(45) — B-3 rejects when the passed mint
+/// authority != `derive_nft_mint_authority(registry.nft_program_id)`.
+const NFT_INVALID_MINT_AUTHORITY: u32 = 45;
+/// `LpVaultOiReservationViolated` = Custom(37) — ExecuteRedemption fail-closed when
+/// the post-redemption OI coverage falls below the reservation threshold.
+const LP_VAULT_OI_RESERVATION_VIOLATED: u32 = 37;
 
 // ── 3A.0-A: all five co-load executable + distinct token roles ──────────────
 
@@ -824,12 +830,21 @@ impl CrosscutEnv {
     /// PDAs (the asset's backing authority was already set to `lp_registry` in
     /// `new()`, completing the two-step handover).
     fn lp_create(&mut self, fee_share_bps: u16, redemption_cooldown_slots: u64) {
+        self.lp_create_full(fee_share_bps, redemption_cooldown_slots, 0);
+    }
+
+    fn lp_create_full(
+        &mut self,
+        fee_share_bps: u16,
+        redemption_cooldown_slots: u64,
+        oi_reservation_threshold_bps: u16,
+    ) {
         let admin = self.admin.insecure_clone();
         self.try_wrapper(
             ProgInstruction::CreateLpVault {
                 fee_share_bps,
                 redemption_cooldown_slots,
-                oi_reservation_threshold_bps: 0,
+                oi_reservation_threshold_bps,
                 domain: CROSSCUT_DOMAIN,
             },
             vec![
@@ -912,8 +927,20 @@ impl CrosscutEnv {
         send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]).expect("lp request redeem");
     }
 
-    /// ExecuteRedemption (tag 68) — permissionless crank. Returns the payout dest.
+    /// ExecuteRedemption (tag 68) — permissionless crank. Expects success.
     fn lp_execute_redeem(&mut self, depositor: &Keypair, redemption: Pubkey) -> Pubkey {
+        let (dest, res) = self.lp_try_execute_redeem(depositor, redemption);
+        res.expect("lp execute redemption");
+        dest
+    }
+
+    /// ExecuteRedemption returning the result (for negative scenarios). Returns
+    /// (payout dest, result).
+    fn lp_try_execute_redeem(
+        &mut self,
+        depositor: &Keypair,
+        redemption: Pubkey,
+    ) -> (Pubkey, Result<(), TransactionError>) {
         let dest = Pubkey::new_unique();
         self.svm
             .set_account(
@@ -944,8 +971,8 @@ impl CrosscutEnv {
             ],
             data: ProgInstruction::ExecuteRedemption.encode(),
         };
-        send_ixs(&mut self.svm, &self.payer, vec![wix], &[]).expect("lp execute redemption");
-        dest
+        let res = send_ixs(&mut self.svm, &self.payer, vec![wix], &[]);
+        (dest, res)
     }
 }
 
@@ -1366,14 +1393,19 @@ fn place_nft_bundle(
 }
 
 impl CrosscutEnv {
-    /// SetNftProgramId (tag 73) — registers the NFT program for this market and
-    /// creates the NftRegistry PDA. Returns the registry key.
+    /// SetNftProgramId (tag 73) — registers the NFT program (real id) for this
+    /// market and creates the NftRegistry PDA. Returns the registry key.
     fn register_nft_program(&mut self) -> Pubkey {
+        self.set_nft_program_id(NFT_PROGRAM_ID)
+    }
+
+    /// SetNftProgramId with an arbitrary id (for X7's wrong-id negative).
+    fn set_nft_program_id(&mut self, nft_program_id: Pubkey) -> Pubkey {
         let (registry, _) = nft_registry_pda(&self.market);
         let admin = self.admin.insecure_clone();
         self.try_wrapper(
             ProgInstruction::SetNftProgramId {
-                nft_program_id: NFT_PROGRAM_ID.to_bytes(),
+                nft_program_id: nft_program_id.to_bytes(),
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
@@ -1978,6 +2010,135 @@ fn x5_nft_locked_portfolio_transfer_rejected() {
         read_portfolio_owner(&env.account_data(portfolio)),
         owner_before,
         "rejected transfer left portfolio.owner unchanged (no rewrite)"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3A.4 — P1 cross-program invariants.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// X8-DELEGATE — the matcher-delegate signer is scoped per (market, maker,
+/// matcher_program, ctx). A delegate bound to maker Y, presented with maker X's
+/// accounts, fails the wrapper's `expect_key` re-derivation (InvalidArgument,
+/// v16_program.rs:7352) BEFORE the matcher CPI runs. Positive control: the
+/// correctly-bound (maker Y) delegate trades.
+#[test]
+fn x8_matcher_delegate_scoped_per_maker_rejects_mismatch() {
+    let mut env = CrosscutEnv::new();
+    let taker_owner = Keypair::new();
+    let maker_x_owner = Keypair::new();
+    let maker_y_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let maker_x = env.create_portfolio(&maker_x_owner);
+    let maker_y = env.create_portfolio(&maker_y_owner);
+    env.deposit(&taker_owner, taker, 1_000_000);
+    env.deposit(&maker_x_owner, maker_x, 1_000_000);
+    env.deposit(&maker_y_owner, maker_y, 1_000_000);
+
+    // Matcher context bound to maker Y (delegate PDA derived for Y).
+    let (ctx_y, delegate_y) = env.init_matcher_context(maker_y);
+
+    // Y's delegate with maker X's accounts → delegate PDA mismatch.
+    let res = env.trade_cpi(
+        &taker_owner, taker, &maker_x_owner, maker_x, ctx_y, delegate_y,
+        CROSSCUT_ASSET, (10 * POS_SCALE) as i128, 100,
+    );
+    assert_instruction_error(
+        &res,
+        InstructionError::InvalidArgument,
+        "matcher delegate bound to maker Y rejects maker X (expect_key mismatch)",
+    );
+
+    // Positive control: the correctly-bound delegate (maker Y) trades.
+    env.trade_cpi(
+        &taker_owner, taker, &maker_y_owner, maker_y, ctx_y, delegate_y,
+        CROSSCUT_ASSET, (10 * POS_SCALE) as i128, 100,
+    )
+    .expect("correctly-bound maker-Y delegate trades");
+    assert_eq!(
+        active_leg_basis(&env.portfolio(taker), CROSSCUT_ASSET),
+        (10 * POS_SCALE) as i128,
+        "positive control opened the position (delegate scoping is the only blocker)"
+    );
+}
+
+/// X7-REGISTRY — the per-market NftRegistry binds the NFT program id. (1) The
+/// registry PDA derives byte-identically on the wrapper side and the NFT side
+/// (both `[b"nft_registry", market]` under MAINNET). (2) A registry pointing at a
+/// WRONG nft_program_id makes a real Token-2022 transfer → hook → B-3 revert
+/// `NftInvalidMintAuthority Custom(45)`: B-3 derives the expected mint authority
+/// from `registry.nft_program_id` (bogus) and it != the real hook-signer PDA.
+#[test]
+fn x7_registry_wrong_nft_program_id_rejects() {
+    let mut env = CrosscutEnv::new();
+    // Point the registry at a bogus id (the real NFT program is still loaded).
+    let bogus = Pubkey::new_unique();
+    let registry = env.set_nft_program_id(bogus);
+    assert_eq!(
+        registry,
+        nft_registry_pda(&env.market).0,
+        "registry PDA derives byte-identically (wrapper == NFT side)"
+    );
+
+    let source_wallet = Keypair::new();
+    env.svm.airdrop(&source_wallet.pubkey(), 10_000_000_000).unwrap();
+    let dest_wallet = Keypair::new();
+    env.svm.airdrop(&dest_wallet.pubkey(), 10_000_000_000).unwrap();
+
+    let (portfolio, nft_pda, nft_mint, source_ata, extra_metas, (mint_auth, _)) = place_nft_bundle(
+        &mut env.svm, &env.payer, &env.market, &registry, &source_wallet, 0, 42, 1_000_000, |_| {},
+    );
+    let dest_ata = create_ata(&mut env.svm, &env.payer, &dest_wallet.pubkey(), &nft_mint);
+    let owner_before = read_portfolio_owner(&env.account_data(portfolio));
+
+    let transfer_ix = transfer_checked_ix(
+        &source_ata, &nft_mint, &dest_ata, &source_wallet.pubkey(),
+        &extra_metas, &nft_pda, &portfolio, &mint_auth, &registry,
+    );
+    let res = send_ixs(&mut env.svm, &env.payer, vec![transfer_ix], &[&source_wallet]);
+    assert_custom(
+        res,
+        NFT_INVALID_MINT_AUTHORITY,
+        "registry pointing at a wrong nft_program_id rejects B-3 (Custom 45)",
+    );
+    assert_eq!(
+        read_portfolio_owner(&env.account_data(portfolio)),
+        owner_before,
+        "rejected transfer left portfolio.owner unchanged"
+    );
+}
+
+/// X3-LP-LIEN — the LP-redemption OI-reservation guard (Custom 37).
+///
+/// CONSTRUCTIBILITY NOTE: the TRUE "matcher/trade OI lien blocks redemption" path
+/// is NOT reachable with the real programs — no wrapper instruction writes the
+/// engine's `valid_liened_backing_num` (it is mutated only by a `#[cfg(test)]`
+/// engine unit path), so a real trade leaves the lien at zero. What IS reachable,
+/// and what this pins in the assembled instance, is the fail-closed threshold
+/// haircut: with `oi_reservation_threshold_bps > 0`, a PARTIAL redemption against
+/// fresh (un-liened) backing reverts `LpVaultOiReservationViolated Custom(37)`
+/// because `covered = nav_post * threshold/10_000 < outstanding_post`. (Logged as a
+/// cross-cut divergence: true OI-lien path deferred / not program-constructible.)
+#[test]
+fn x3_lp_redemption_oi_reservation_guard_fires() {
+    let mut env = CrosscutEnv::new();
+    env.lp_create_full(0, 0, 5_000); // 50% OI-reservation threshold
+    let depositor = Keypair::new();
+    env.svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let l: u128 = 1_000_000;
+    let (lp_ata, _src) = env.lp_deposit(&depositor, l);
+    // Executed guard: the deposit really minted shares (the guard isn't trivially met).
+    assert_eq!(env.token_amount(lp_ata), l as u64, "deposit minted LP shares");
+
+    // A PARTIAL redemption against fresh backing is fail-closed by the OI guard.
+    let redemption =
+        state::derive_lp_redemption(&env.program_id, &env.lp_registry, &depositor.pubkey()).0;
+    env.lp_request_redeem(&depositor, redemption, lp_ata, l / 2);
+    let (_dest, res) = env.lp_try_execute_redeem(&depositor, redemption);
+    assert_custom(
+        res,
+        LP_VAULT_OI_RESERVATION_VIOLATED,
+        "partial redeem under a non-zero OI threshold is fail-closed (Custom 37)",
     );
 }
 
