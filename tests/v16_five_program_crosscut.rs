@@ -68,6 +68,9 @@ const NOT_INITIALIZED: u32 = 3;
 /// `EngineLockActive` — ordinal 21. Market-state guard (e.g. flush/topup into a
 /// non-Live market; terminal-reclaim preconditions).
 const E_LOCK_ACTIVE: u32 = 21;
+/// NFT `TransferBlocked` = Custom(24) — the transfer-hook's `transfer_gate_check`
+/// rejecting a locked/stale/resolved portfolio (fires before B-3).
+const NFT_TRANSFER_BLOCKED: u32 = 24;
 
 // ── 3A.0-A: all five co-load executable + distinct token roles ──────────────
 
@@ -733,6 +736,87 @@ impl CrosscutEnv {
     }
 }
 
+// ── Trade / accrual / crank helpers (lifted from v16_fork_adversarial.rs) ────
+
+impl CrosscutEnv {
+    /// Two-party TradeNoCpi (no matcher) on CROSSCUT_ASSET.
+    #[allow(clippy::too_many_arguments)]
+    fn try_trade(
+        &mut self,
+        owner_a: &Keypair,
+        account_a: Pubkey,
+        owner_b: &Keypair,
+        account_b: Pubkey,
+        size_q: i128,
+        exec_price: u64,
+        fee_bps: u64,
+    ) -> Result<(), TransactionError> {
+        let wix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(account_a, false),
+                AccountMeta::new(account_b, false),
+            ],
+            data: ProgInstruction::TradeNoCpi {
+                asset_index: CROSSCUT_ASSET,
+                size_q,
+                exec_price,
+                fee_bps,
+            }
+            .encode(),
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![wix], &[owner_a, owner_b])
+    }
+
+    /// Move the asset mark via the engine's zero-sum accrual (the faithful effect
+    /// of a real oracle push + crank). Direct state write (adversarial:404-414).
+    fn accrue_mark(&mut self, now_slot: u64, effective_price: u64) {
+        let mut acct = self.svm.get_account(&self.market).expect("market");
+        {
+            let (_, mut group) = state::market_view_mut(&mut acct.data).expect("market view");
+            group
+                .accrue_asset_to_not_atomic(CROSSCUT_ASSET as usize, now_slot, effective_price, 0, true)
+                .expect("accrue");
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+    }
+
+    /// PermissionlessCrank on CROSSCUT_ASSET (action 0 = refresh, 1 = liquidate).
+    fn crank(&mut self, portfolio: Pubkey, action: u8, now_slot: u64, close_q: u128) -> Result<(), TransactionError> {
+        let wix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            data: ProgInstruction::PermissionlessCrank {
+                action,
+                asset_index: CROSSCUT_ASSET,
+                now_slot,
+                funding_rate_e9: 0,
+                close_q,
+                fee_bps: 0,
+                recovery_reason: 0,
+            }
+            .encode(),
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![wix], &[])
+    }
+
+    fn leg_basis(&self, p: Pubkey) -> i128 {
+        self.portfolio(p)
+            .legs
+            .iter()
+            .find(|l| l.active && l.asset_index as usize == CROSSCUT_ASSET as usize)
+            .map(|l| l.basis_pos_q)
+            .unwrap_or(0)
+    }
+}
+
 // ── LP-vault helpers (mirrors v16_fork_lp_vault_*.rs, re-keyed MAINNET) ──────
 
 impl CrosscutEnv {
@@ -1192,7 +1276,7 @@ fn transfer_checked_ix(
 /// Place the full NFT bundle on a fresh crafted portfolio bound to `market`:
 /// real Token-2022 mint + ATA + 1 token, plus injected PositionNft / ExtraMetas /
 /// mint-authority PDAs. Returns the keys. (adapts place_nft_bundle_real_mint)
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn place_nft_bundle(
     svm: &mut LiteSVM,
     payer: &Keypair,
@@ -1202,6 +1286,7 @@ fn place_nft_bundle(
     asset_index: u16,
     market_id: u64,
     basis_pos_q: i128,
+    mut portfolio_mutate: impl FnMut(&mut Vec<u8>),
 ) -> (Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, (Pubkey, u8)) {
     let portfolio_key = Pubkey::new_unique();
     let nft_mint_kp = Keypair::new();
@@ -1216,7 +1301,7 @@ fn place_nft_bundle(
     create_ata(svm, payer, &owner_wallet.pubkey(), &nft_mint_key);
     mint_one_to_ata(svm, payer, &nft_mint_key, &source_ata_key);
 
-    let port_data = portfolio_data(
+    let mut port_data = portfolio_data(
         &portfolio_key,
         market,
         &owner_bytes,
@@ -1224,6 +1309,7 @@ fn place_nft_bundle(
         market_id,
         basis_pos_q,
     );
+    portfolio_mutate(&mut port_data);
     svm.set_account(
         portfolio_key,
         Account {
@@ -1321,8 +1407,17 @@ fn x0_nft_transfer_hook_b3_ownership_at_mainnet() {
     let dest_wallet = Keypair::new();
     env.svm.airdrop(&dest_wallet.pubkey(), 10_000_000_000).unwrap();
 
-    let (portfolio, nft_pda, nft_mint, source_ata, extra_metas, (mint_auth, _)) =
-        place_nft_bundle(&mut env.svm, &env.payer, &env.market, &registry, &source_wallet, 0, 42, 1_000_000);
+    let (portfolio, nft_pda, nft_mint, source_ata, extra_metas, (mint_auth, _)) = place_nft_bundle(
+        &mut env.svm,
+        &env.payer,
+        &env.market,
+        &registry,
+        &source_wallet,
+        0,
+        42,
+        1_000_000,
+        |_| {},
+    );
 
     let dest_ata = create_ata(&mut env.svm, &env.payer, &dest_wallet.pubkey(), &nft_mint);
 
@@ -1759,6 +1854,131 @@ fn x5_terminal_reclaim_liveness_via_rotate_no_lockout() {
     assert_eq!(env.token_amount(dest), amount, "reclaimed EXACTLY the flushed insurance");
     assert_eq!(env.token_amount(env.vault), 0, "wrapper vault drained by terminal reclaim");
     assert_eq!(env.group().insurance, 0, "insurance fully reclaimed");
+}
+
+/// Run the flush + bankrupt-short-liquidation scenario in a fresh 5-program
+/// instance, in the given ordering. Returns (end_insurance, end_vault_token,
+/// short_leg_basis_after). Asserts vault lockstep internally.
+fn run_flush_liquidation(flush_first: bool, flush_amount: u64) -> (u128, u64, i128) {
+    let mut env = CrosscutEnv::new();
+    let lp = Keypair::new();
+    let weak = Keypair::new();
+    let la = env.create_portfolio(&lp);
+    let wa = env.create_portfolio(&weak);
+    env.deposit(&lp, la, 1_000_000);
+    env.deposit(&weak, wa, 250); // thin short — will go bankrupt
+    env.try_trade(&lp, la, &weak, wa, POS_SCALE as i128, 100, 0)
+        .expect("open lp-long / weak-short");
+    // Walk the mark up so the short's loss (≈300) exceeds its 250 deposit.
+    for (slot, price) in [(10u64, 200u64), (20, 300), (30, 400)] {
+        env.warp(slot);
+        env.accrue_mark(slot, price);
+        let _ = env.crank(wa, 0, slot, 0);
+        let _ = env.crank(la, 0, slot, 0);
+    }
+
+    let ctx = env.setup_stake_pool(flush_amount);
+    env.stake_bind(&ctx).expect("bind");
+
+    if flush_first {
+        env.stake_flush(&ctx, flush_amount).expect("flush");
+        env.crank(wa, 1, 30, POS_SCALE).expect("liquidate bankrupt short");
+    } else {
+        env.crank(wa, 1, 30, POS_SCALE).expect("liquidate bankrupt short");
+        env.stake_flush(&ctx, flush_amount).expect("flush");
+    }
+
+    let g = env.group();
+    assert_eq!(
+        g.vault,
+        env.token_amount(env.vault) as u128,
+        "group.vault ledger == on-chain SPL vault (lockstep) at scenario end"
+    );
+    (g.insurance, env.token_amount(env.vault), env.leg_basis(wa))
+}
+
+/// X2-FLUSH-RACE (part 2) — stake flush vs a concurrent liquidation crank. In
+/// single-threaded LiteSVM the "race" is order-sensitivity: both interleavings
+/// must reach the SAME conserved end state. The flush is cleanly additive to
+/// insurance; the liquidation (asset-1 bankrupt short; no liquidation fee, no
+/// cranker reward, and the flush funded only asset-0's domain budget) draws
+/// nothing from insurance and never moves the vault. Executed guard: the
+/// liquidation actually fires (short leg closes) in both orderings.
+#[test]
+fn x2_flush_race_liquidation_crank_order_independent() {
+    let flush: u64 = 1_000_000;
+    let (ins_ff, vault_ff, leg_ff) = run_flush_liquidation(true, flush);
+    let (ins_lf, vault_lf, leg_lf) = run_flush_liquidation(false, flush);
+
+    // Executed guard: the bankrupt short was actually liquidated (leg closed) both ways.
+    assert_eq!(leg_ff, 0, "flush-first: bankrupt short liquidated");
+    assert_eq!(leg_lf, 0, "liquidate-first: bankrupt short liquidated");
+
+    // Order independence: identical end state regardless of interleaving.
+    assert_eq!(ins_ff, ins_lf, "insurance order-independent across flush vs liquidation");
+    assert_eq!(vault_ff, vault_lf, "vault order-independent across flush vs liquidation");
+
+    // Flush is cleanly additive: the liquidation drew nothing from the flushed insurance.
+    assert_eq!(ins_ff, flush as u128, "insurance == exactly the flushed amount (no liquidation draw)");
+}
+
+/// X5-TERMINAL (NFT-lock half) — an NFT-bundled portfolio that is LOCKED
+/// (liquidation_lock=1, the post-resolve/locked condition) rejects the B-3
+/// ownership transfer: the transfer-hook gate fires and ownership is NOT rewritten.
+/// This proves a locked portfolio's NFT cannot be transferred — so it cannot be
+/// used to strand state — in the 5-program instance (combined with X5's proven
+/// reclaim liveness, the lock blocks transfer but never the insurance reclaim).
+#[test]
+fn x5_nft_locked_portfolio_transfer_rejected() {
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    let source_wallet = Keypair::new();
+    env.svm.airdrop(&source_wallet.pubkey(), 10_000_000_000).unwrap();
+    let dest_wallet = Keypair::new();
+    env.svm.airdrop(&dest_wallet.pubkey(), 10_000_000_000).unwrap();
+
+    // Craft an NFT bundle whose portfolio is LOCKED.
+    let (portfolio, nft_pda, nft_mint, source_ata, extra_metas, (mint_auth, _)) = place_nft_bundle(
+        &mut env.svm,
+        &env.payer,
+        &env.market,
+        &registry,
+        &source_wallet,
+        0,
+        42,
+        1_000_000,
+        |data| {
+            let off = HEADER_LEN;
+            let len = core::mem::size_of::<PortfolioAccountV16Account>();
+            let p: &mut PortfolioAccountV16Account =
+                bytemuck::from_bytes_mut(&mut data[off..off + len]);
+            p.liquidation_lock = 1;
+        },
+    );
+    let dest_ata = create_ata(&mut env.svm, &env.payer, &dest_wallet.pubkey(), &nft_mint);
+    let owner_before = read_portfolio_owner(&env.account_data(portfolio));
+
+    let transfer_ix = transfer_checked_ix(
+        &source_ata,
+        &nft_mint,
+        &dest_ata,
+        &source_wallet.pubkey(),
+        &extra_metas,
+        &nft_pda,
+        &portfolio,
+        &mint_auth,
+        &registry,
+    );
+    let res = send_ixs(&mut env.svm, &env.payer, vec![transfer_ix], &[&source_wallet]);
+
+    // The transfer-hook gate blocks a locked portfolio with the exact operative code;
+    // ownership is NOT rewritten.
+    assert_custom(res, NFT_TRANSFER_BLOCKED, "locked-portfolio NFT transfer is gate-blocked");
+    assert_eq!(
+        read_portfolio_owner(&env.account_data(portfolio)),
+        owner_before,
+        "rejected transfer left portfolio.owner unchanged (no rewrite)"
+    );
 }
 
 /// 3A.1b — a real matcher `TradeCpi` fires through the loaded `percolator_match`
