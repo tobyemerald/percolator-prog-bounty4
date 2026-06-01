@@ -5595,13 +5595,6 @@ fn v16_bpf_configure_and_push_auth_mark_are_bounded_and_clock_authenticated() {
 }
 
 #[test]
-// RESYNC-TODO(2b6c80e): this a757262 test depends on the per-asset segment-dt
-// crank-price clamp (asset_segment_dt_view) introduced by 2b6c80e — with the
-// pre-2b6c80e group-wide hybrid_segment_dt_view the clamp collapses effective→raw
-// so the adverse target/effective-lag penalty is 0 (verified: raw=90M,
-// effective=99.76M, maint_req=99.76M = no penalty). Un-#[ignore] and verify after
-// the 2b6c80e cherry-pick lands the per-asset dt clamp.
-#[ignore = "RESYNC-TODO(2b6c80e): depends on per-asset segment-dt crank clamp; un-ignore after 2b6c80e"]
 fn v16_bpf_auth_mark_target_effective_lag_counts_toward_liquidation_health() {
     const INITIAL_MARK: u64 = 100_000_000;
     const TARGET_MARK: u64 = 90_000_000;
