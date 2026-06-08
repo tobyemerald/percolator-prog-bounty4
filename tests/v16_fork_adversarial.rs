@@ -37,8 +37,12 @@
 //! `tests/v16_nft_e2e.rs`. The LP-vault deferred tests live in
 //! `tests/v16_fork_lp_vault_*` and a Phase-2.E addition at the bottom of this file.
 
-use percolator::{MarketGroupV16, PortfolioAccountV16, POS_SCALE};
-use percolator_prog::{ix::Instruction as ProgInstruction, processor::ASSET_ACTION_ACTIVATE, state};
+use percolator::POS_SCALE;
+use percolator_prog::{
+    ix::Instruction as ProgInstruction,
+    processor::ASSET_ACTION_ACTIVATE,
+    state::{self, MarketGroupV16, PortfolioAccountV16},
+};
 use solana_sdk::{
     account::Account,
     compute_budget::ComputeBudgetInstruction,
