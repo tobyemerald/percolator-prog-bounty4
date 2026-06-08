@@ -3249,7 +3249,11 @@ pub mod state {
             .get(HEADER_LEN..nft_registry_account_len())
             .ok_or(PercolatorError::InvalidAccountLen)?;
         let reg: NftRegistryV16 = bytemuck::pod_read_unaligned(bytes);
-        if reg.version != NFT_REGISTRY_VERSION || reg.market_group == [0u8; 32] {
+        if reg.version != NFT_REGISTRY_VERSION
+            || reg.market_group == [0u8; 32]
+            || reg.nft_program_id == [0u8; 32]
+            || reg._padding != [0u8; 6]
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(reg)
