@@ -1490,25 +1490,51 @@ fn kani_v16_every_active_payload_rejects_one_byte_truncation() {
 #[kani::proof]
 #[kani::unwind(1)]
 fn kani_lp_vault_redemption_split_conservation() {
-    // Symbolic small-range inputs (u8 → u128 cast, all products < u16::MAX).
-    let total_principal: u128 = kani::any::<u8>() as u128;
-    let net_earnings: u128 = kani::any::<u8>() as u128;
-    let fee_share_bps: u128 = kani::any::<u8>() as u128;
-    let shares: u128 = kani::any::<u8>() as u128;
-    let total_shares: u128 = kani::any::<u8>() as u128;
-
-    // Preconditions (mirrors handle_execute_redemption guards).
-    kani::assume(total_shares > 0);
+    // Symbolic small-range inputs (u8 → u32 cast; all products < u32::MAX so CBMC's
+    // 32-bit divider is cheap — exact for the conservation algebra, same as toly's
+    // u8-small-reference wide-math standard. u128 here triggers CBMC's expensive
+    // 128-bit divide circuit under unwind(1) and times out / fails spuriously).
+    // Inputs bounded to a small range so CBMC's symbolic*symbolic multipliers stay
+    // tiny. The conservation algebra (floor-rounding of the split) is fully exercised
+    // at small scale — the same small-reference principle as toly's u8 wide-math
+    // proofs. lp_earnings is a FREE symbolic value, NOT pinned through the large
+    // ×10_000 fee-share term: the split-conservation properties depend only on
+    // nav = available_principal + lp_earnings and shares <= total_shares, so proving
+    // them for ALL lp_earnings >= 0 is STRICTLY STRONGER than for fee-share-derived
+    // values, and it drops the nonlinear net*fee term that makes CBMC's SAT intractable.
+    // (That lp_earnings == floor(net*fee/10_000) and the redemption decrement is
+    // fee-share-exact is certified separately by the fee_share_split_preserved proof.)
+    let total_principal: u32 = kani::any();
+    let lp_earnings: u32 = kani::any();
+    let shares: u32 = kani::any();
+    let total_shares: u32 = kani::any();
+    kani::assume(total_principal <= 64);
+    kani::assume(lp_earnings <= 64);
+    kani::assume(shares <= 64);
+    kani::assume(total_shares >= 1 && total_shares <= 64);
     kani::assume(shares <= total_shares);
-    kani::assume(fee_share_bps <= 10_000u128);
-    // No impairment (net_impairment = 0) for this proof.
-    let available_principal = total_principal;
+    let available_principal = total_principal; // no impairment (net_impairment = 0)
 
-    // For u8-range inputs all products fit in u128; direct division == floor().
-    let lp_earnings = (net_earnings * fee_share_bps) / 10_000;
-    let nav = available_principal + lp_earnings; // no overflow: max = 255+255 = 510
-    let atoms = (shares * nav) / total_shares;
-    let principal_portion = (shares * available_principal) / total_shares;
+    let nav = available_principal + lp_earnings; // <= 128
+
+    // DIVISION-FREE: model each floor-quotient q = floor(n/d) by the unique
+    // characterization  q*d <= n < (q+1)*d  (d = total_shares >= 1). CBMC handles
+    // these multiplicative constraints with no divide circuit (no unwinding assertion).
+    // Loose upper bounds prevent overflow in (q+1)*d WITHOUT assuming any conclusion.
+
+    // atoms = floor(shares * nav / total_shares)
+    let sh_nav = shares * nav; // <= 64 * 128 = 8192
+    let atoms: u32 = kani::any();
+    kani::assume(atoms <= sh_nav);
+    kani::assume(atoms * total_shares <= sh_nav);
+    kani::assume(sh_nav < (atoms + 1) * total_shares);
+
+    // principal_portion = floor(shares * available_principal / total_shares)
+    let sh_ap = shares * available_principal; // <= 64 * 64 = 4096
+    let principal_portion: u32 = kani::any();
+    kani::assume(principal_portion <= sh_ap);
+    kani::assume(principal_portion * total_shares <= sh_ap);
+    kani::assume(sh_ap < (principal_portion + 1) * total_shares);
 
     // earnings_portion = atoms - principal_portion (must not underflow).
     assert!(
@@ -1546,98 +1572,163 @@ fn kani_lp_vault_redemption_split_conservation() {
         principal_portion <= total_principal,
         "guard invariant: principal_portion always <= total_principal_atoms"
     );
+
+    // Non-vacuity: the interesting states are reachable (the assumptions are not
+    // over-constrained into a trivially-true path).
+    kani::cover!(
+        earnings_portion > 0,
+        "reachable: a real earnings split occurs (proof is not vacuous)"
+    );
+    kani::cover!(
+        principal_portion > 0 && earnings_portion > 0,
+        "reachable: both principal and earnings portions nonzero"
+    );
 }
 
 // ── LP Vault fee_share split preservation across redemptions ─────────────────
 //
-// Proves the ECONOMICALLY-CORRECT gross_consumed model (v17 Step-3 fix):
+// Certifies the ECONOMICALLY-CORRECT gross_consumed model (v17 Step-3 fix):
 //
 //   gross_consumed = ceil(earnings_portion * 10_000 / fee_share_bps)
 //
-// After the redemption, remaining LPs' lp_earnings drops by EXACTLY earnings_portion:
+// Production-valid invariant (the SAFE direction — no LP over-extraction):
 //
-//   lp_earnings_after = floor((net - gross_consumed) * fee_share / 10_000)
-//                     = lp_earnings_before - earnings_portion
+//   lp_earnings_after + earnings_portion <= lp_earnings_before
 //
-// This certifies the fee_share split is preserved — the insurance stub
-// (gross_consumed - earnings_portion) is NOT accessible to future LP redemptions.
+// i.e. after a redemption the remaining LPs' claimable earnings drop by AT LEAST
+// earnings_portion. The ceil rounds sub-atom dust into the insurance stub
+// (gross_consumed - earnings_portion >= 0), which is NOT accessible to future LP
+// redemptions. NOTE: this is an INEQUALITY, not the idealized `==`. With a fee that
+// does not divide 10_000 evenly (the production case, fee up to 10_000 — e.g. 3333),
+// the ceil over-consumes by up to one unit, so equality is FALSE in production; the
+// inequality is the honest, production-valid property. (The 89382f1 bug used
+// gross_consumed = earnings_portion, which rounds the OTHER way and lets future LPs
+// extract the stub — that is what this fix closes.)
 //
-// RED CONTROL: if gross_consumed = earnings_portion (the 89382f1 bug), the proof
-// FAILS whenever fee_share_bps < 10_000 and earnings_portion > 0 (the split breaks).
-//
-// Uses u8-range symbolic inputs for tractability.
 // Cross-ref: src/v16_program.rs handle_execute_redemption gross_consumed computation.
-
-// Uses direct u128 arithmetic for CBMC tractability (same rationale as above).
-// For u8-range inputs, ceil(a * b / d) == (a * b + d - 1) / d — exact in u128.
-// unwind(1): no loops in direct u128 arithmetic.
+//
+// DIVISION-FREE / scaled small-reference (see body); #[kani::unwind(1)] is correct —
+// the multiplicative-characterization formulation has no loops and no divide circuit.
 #[kani::proof]
 #[kani::unwind(1)]
 fn kani_lp_vault_redemption_fee_share_split_preserved() {
-    // Symbolic small-range inputs (u8 → u128, all products < u16::MAX).
-    let net_earnings: u128 = kani::any::<u8>() as u128;
-    let fee_share_bps: u128 = kani::any::<u8>() as u128;
-    let shares: u128 = kani::any::<u8>() as u128;
-    let total_shares: u128 = kani::any::<u8>() as u128;
-    let available_principal: u128 = kani::any::<u8>() as u128;
+    // SCALED small-reference. Production uses DENOM = 10_000 bps; the floor/ceil
+    // gross-up algebra is denom-invariant, so we verify at DENOM = 100 to keep CBMC's
+    // symbolic*symbolic products tiny. CRUCIALLY this lets `fee` range over values that
+    // do NOT divide DENOM evenly (e.g. 3, 7, 33) — exactly the production case where
+    // the ceil over-consumes. The previous proof clamped fee to u8 (<=255) and asserted
+    // a strict EQUALITY; that equality only holds on that restricted domain and is FALSE
+    // in production (fee up to 10_000, e.g. 3333), so it was a masked proof. The correct,
+    // production-valid invariant is the INEQUALITY below: the ceil rounds dust into the
+    // insurance stub, so remaining LPs' claimable earnings drop by AT LEAST earnings_portion
+    // — never less (no LP over-extraction, the safe direction; the exact opposite of the
+    // 89382f1 bug). DIVISION-FREE: every floor/ceil quotient is modelled by its
+    // multiplicative characterization (no divide circuit, no unwinding-assertion artifact).
+    const DENOM: u32 = 100;
 
-    // Preconditions.
-    kani::assume(total_shares > 0);
+    let net_earnings: u32 = kani::any();
+    let fee: u32 = kani::any();
+    let shares: u32 = kani::any();
+    let total_shares: u32 = kani::any();
+    let available_principal: u32 = kani::any();
+    kani::assume(net_earnings <= 30);
+    kani::assume(fee <= DENOM); // 0..=100 (covers non-dividing fees)
+    kani::assume(shares <= 30);
+    kani::assume(total_shares >= 1 && total_shares <= 30);
     kani::assume(shares <= total_shares);
-    kani::assume(fee_share_bps <= 10_000u128);
+    kani::assume(available_principal <= 30);
 
-    // lp_earnings_before = floor(net * fee_share / 10_000).
-    // For u8-range inputs: net_earnings * fee_share <= 255 * 255 = 65025 < u128::MAX.
-    let lp_earnings_before = (net_earnings * fee_share_bps) / 10_000;
+    // lp_earnings_before = floor(net * fee / DENOM)   via  lpb*DENOM <= net*fee < (lpb+1)*DENOM
+    let nf = net_earnings * fee; // <= 3000
+    let lpb: u32 = kani::any();
+    kani::assume(lpb <= nf); // loose overflow guard
+    kani::assume(lpb * DENOM <= nf);
+    kani::assume(nf < (lpb + 1) * DENOM);
 
-    // NAV and atoms (all products < 255 * (255 + 255) = 130050, fits in u128).
-    let nav = available_principal + lp_earnings_before;
-    let atoms = (shares * nav) / total_shares;
-    let principal_portion = (shares * available_principal) / total_shares;
-    assert!(atoms >= principal_portion, "no underflow on earnings_portion");
-    let earnings_portion = atoms - principal_portion;
+    let nav = available_principal + lpb; // <= 60
 
-    // gross_consumed = ceil(earnings_portion * 10_000 / fee_share_bps).
-    // For u8-range: earnings_portion <= 255, * 10_000 <= 2_550_000 < u128::MAX.
-    let gross_consumed: u128 = if earnings_portion == 0 {
-        0
+    // atoms = floor(shares * nav / total_shares)
+    let sh_nav = shares * nav; // <= 30*60 = 1800
+    let atoms: u32 = kani::any();
+    kani::assume(atoms <= sh_nav);
+    kani::assume(atoms * total_shares <= sh_nav);
+    kani::assume(sh_nav < (atoms + 1) * total_shares);
+
+    // principal_portion = floor(shares * available_principal / total_shares)
+    let sh_ap = shares * available_principal; // <= 900
+    let pp: u32 = kani::any();
+    kani::assume(pp <= sh_ap);
+    kani::assume(pp * total_shares <= sh_ap);
+    kani::assume(sh_ap < (pp + 1) * total_shares);
+
+    assert!(atoms >= pp, "no underflow on earnings_portion");
+    let earnings_portion = atoms - pp;
+
+    // gross_consumed = ceil(earnings_portion * DENOM / fee)  (0 if earnings_portion == 0)
+    // ceil characterization for gc>0:  (gc-1)*fee < earnings*DENOM <= gc*fee
+    let ed = earnings_portion * DENOM; // <= 6000
+    let gc: u32 = kani::any();
+    if earnings_portion == 0 {
+        kani::assume(gc == 0);
     } else {
-        // fee_share_bps > 0 guaranteed when earnings_portion > 0.
-        // ceil(a / d) = (a + d - 1) / d.
-        (earnings_portion * 10_000 + fee_share_bps - 1) / fee_share_bps
-    };
-
-    // SPLIT PRESERVATION: remaining lp_earnings after gross_consumed consumed.
-    assert!(
-        gross_consumed <= net_earnings,
-        "gross_consumed never exceeds net_earnings"
-    );
-
-    let net_after = net_earnings - gross_consumed;
-    let lp_earnings_after = (net_after * fee_share_bps) / 10_000;
-
-    // CONSERVATION 5 (fee_share split preserved):
-    // lp_earnings drops by exactly earnings_portion after the redemption.
-    assert_eq!(
-        lp_earnings_before,
-        lp_earnings_after + earnings_portion,
-        "fee_share split preserved: lp_earnings_after + earnings_portion == lp_earnings_before"
-    );
-
-    // CONSERVATION 6 (insurance stub in vault):
-    // gross_consumed >= earnings_portion; the stub stays in vault.
-    assert!(
-        gross_consumed >= earnings_portion,
-        "insurance stub is non-negative (gross_consumed >= earnings_portion)"
-    );
-    let insurance_stub = gross_consumed - earnings_portion;
-    // When fee_share == 10_000, the insurance stub is 0 (LP gets everything).
-    if fee_share_bps == 10_000 {
-        assert_eq!(insurance_stub, 0, "full fee_share: no insurance stub");
+        // fee > 0 here: earnings>0 => atoms>pp => nav>ap => lpb>0 => nf>0 => fee>0.
+        kani::assume(gc >= 1);
+        kani::assume(gc <= ed); // loose overflow guard (true gc <= net <= 30)
+        kani::assume(gc * fee >= ed); // ceil lower bound
+        kani::assume((gc - 1) * fee < ed); // ceil upper bound (gc is the smallest such)
     }
-    // When fee_share == 0, no earnings go to LP.
-    if fee_share_bps == 0 {
+
+    // CONSERVATION 6: insurance stub non-negative — gross_consumed >= earnings_portion.
+    // (gc*fee >= earnings*DENOM and DENOM >= fee  =>  gc >= earnings_portion.)
+    assert!(
+        gc >= earnings_portion,
+        "insurance stub non-negative (gross_consumed >= earnings_portion)"
+    );
+
+    // gross_consumed never exceeds net_earnings (earnings <= lpb <= net*fee/DENOM => gc <= net).
+    assert!(gc <= net_earnings, "gross_consumed never exceeds net_earnings");
+
+    let net_after = net_earnings - gc;
+
+    // lp_earnings_after = floor(net_after * fee / DENOM)
+    let naf = net_after * fee; // <= 3000
+    let lpa: u32 = kani::any();
+    kani::assume(lpa <= naf);
+    kani::assume(lpa * DENOM <= naf);
+    kani::assume(naf < (lpa + 1) * DENOM);
+
+    // CONSERVATION 5 (CORRECTED — production-valid INEQUALITY, not the idealized ==):
+    // remaining LPs' claimable earnings drop by AT LEAST earnings_portion.
+    //   lpa*DENOM <= naf = nf - gc*fee <= nf - earnings*DENOM < (lpb+1-earnings)*DENOM
+    //   => lpa + earnings_portion <= lpb
+    assert!(
+        lpa + earnings_portion <= lpb,
+        "fee_share split preserved (LP-safe): lp_earnings_after + earnings_portion <= lp_earnings_before"
+    );
+
+    // When fee == DENOM the LP gets everything: gross_consumed == earnings_portion (no stub dust).
+    if fee == DENOM {
+        assert_eq!(
+            gc, earnings_portion,
+            "full fee_share: gross_consumed == earnings_portion (no insurance stub)"
+        );
+    }
+    // When fee == 0, no earnings go to LP.
+    if fee == 0 {
         assert_eq!(earnings_portion, 0, "zero fee_share: LP gets no earnings");
-        assert_eq!(gross_consumed, 0, "zero fee_share: no gross consumed");
+        assert_eq!(gc, 0, "zero fee_share: no gross consumed");
     }
+
+    // Non-vacuity AND justification for the `<=` (vs the old `==`): prove the strict
+    // case is reachable. If `lpa + earnings_portion < lpb` is COVERED, the ceil dust
+    // genuinely makes the relation strict for some in-range inputs — i.e. the old
+    // equality assertion was false there, confirming the correction is necessary.
+    kani::cover!(
+        earnings_portion > 0,
+        "reachable: a real earnings split occurs (proof is not vacuous)"
+    );
+    kani::cover!(
+        lpa + earnings_portion < lpb,
+        "reachable: ceil dust makes the relation STRICT (the old `==` assertion would FAIL here)"
+    );
 }
