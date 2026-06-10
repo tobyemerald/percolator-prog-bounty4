@@ -141,11 +141,11 @@ fn kani_v16_init_market_decode_preserves_wire_fields() {
 #[kani::proof]
 fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
     let tag: u8 = kani::any();
+    // Note: tag 23 (WithdrawInsuranceLimited) removed in v17 auth overhaul.
     kani::assume(
         tag == 3
             || tag == 4
             || tag == 9
-            || tag == 23
             || tag == 28
             || tag == 30
             || tag == 41
@@ -162,9 +162,6 @@ fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
         (3, Instruction::Deposit { amount: got }) => assert_eq!(got, amount),
         (4, Instruction::Withdraw { amount: got }) => assert_eq!(got, amount),
         (9, Instruction::TopUpInsurance { amount: got }) => assert_eq!(got, amount),
-        (23, Instruction::WithdrawInsuranceLimited { amount: got }) => {
-            assert_eq!(got, amount)
-        }
         (28, Instruction::ConvertReleasedPnl { amount: got }) => assert_eq!(got, amount),
         (30, Instruction::CloseResolved { fee_rate_per_slot }) => {
             assert_eq!(fee_rate_per_slot, amount)
@@ -185,13 +182,15 @@ fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
-    let domain: u8 = kani::any();
+    // v17: domain fields are u16 (not u8).
+    let domain: u16 = kani::any();
     let amount: u128 = kani::any();
 
-    let mut top_up = [0u8; 18];
+    // TopUpInsuranceDomain: tag(1) + domain(u16=2) + amount(u128=16) = 19 bytes.
+    let mut top_up = [0u8; 19];
     top_up[0] = 56;
-    top_up[1] = domain;
-    top_up[2..18].copy_from_slice(&amount.to_le_bytes());
+    top_up[1..3].copy_from_slice(&domain.to_le_bytes());
+    top_up[3..19].copy_from_slice(&amount.to_le_bytes());
     match Instruction::decode(&top_up).unwrap() {
         Instruction::TopUpInsuranceDomain {
             domain: got_domain,
@@ -203,16 +202,19 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
         _ => unreachable!(),
     }
 
-    let mut withdraw = [0u8; 18];
+    // v17: tag 57 is now WithdrawInsuranceAsset { asset_index: u16, amount: u128 }.
+    // (WithdrawInsuranceDomain was removed in the v17 auth overhaul.)
+    let mut withdraw = [0u8; 19];
+    let asset_index: u16 = kani::any();
     withdraw[0] = 57;
-    withdraw[1] = domain;
-    withdraw[2..18].copy_from_slice(&amount.to_le_bytes());
+    withdraw[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    withdraw[3..19].copy_from_slice(&amount.to_le_bytes());
     match Instruction::decode(&withdraw).unwrap() {
-        Instruction::WithdrawInsuranceDomain {
-            domain: got_domain,
+        Instruction::WithdrawInsuranceAsset {
+            asset_index: got_asset_index,
             amount: got_amount,
         } => {
-            assert_eq!(got_domain, domain);
+            assert_eq!(got_asset_index, asset_index);
             assert_eq!(got_amount, amount);
         }
         _ => unreachable!(),
@@ -305,15 +307,16 @@ fn kani_v16_recovery_close_progress_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_top_up_backing_bucket_decode_preserves_wire_fields() {
-    let domain: u8 = kani::any();
+    // v17: domain is u16. Wire: tag(1) + domain(u16=2) + amount(u128=16) + expiry_slot(u64=8) = 27.
+    let domain: u16 = kani::any();
     let amount: u128 = kani::any();
     let expiry_slot: u64 = kani::any();
 
-    let mut data = [0u8; 26];
+    let mut data = [0u8; 27];
     data[0] = 24;
-    data[1] = domain;
-    data[2..18].copy_from_slice(&amount.to_le_bytes());
-    data[18..26].copy_from_slice(&expiry_slot.to_le_bytes());
+    data[1..3].copy_from_slice(&domain.to_le_bytes());
+    data[3..19].copy_from_slice(&amount.to_le_bytes());
+    data[19..27].copy_from_slice(&expiry_slot.to_le_bytes());
 
     match Instruction::decode(&data).unwrap() {
         Instruction::TopUpBackingBucket {
@@ -331,7 +334,8 @@ fn kani_v16_top_up_backing_bucket_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_withdraw_backing_bucket_decode_preserves_wire_fields() {
-    let domain: u8 = kani::any();
+    // v17: domain is u16.
+    let domain: u16 = kani::any();
     let amount: u128 = kani::any();
 
     let data = Instruction::WithdrawBackingBucket { domain, amount }.encode();
@@ -578,8 +582,12 @@ fn kani_v16_permissionless_crank_decode_preserves_wire_fields() {
     }
 }
 
+// v17 auth overhaul: UpdateAuthority (tag 32) now rotates ONLY the single
+// market-level authority (marketauth); the `kind` field was removed.
+// Per-asset authority rotation moved to UpdateAssetAuthority (tag 65).
 #[kani::proof]
 fn kani_v16_update_authority_decode_preserves_wire_fields() {
+    let asset_index: u16 = kani::any();
     let kind: u8 = kani::any();
     let mut new_pubkey = [0u8; 32];
     let mut i = 0;
@@ -588,16 +596,31 @@ fn kani_v16_update_authority_decode_preserves_wire_fields() {
         i += 1;
     }
 
-    let mut data = [0u8; 34];
-    data[0] = 32;
-    data[1] = kind;
-    data[2..34].copy_from_slice(&new_pubkey);
-
+    // Tag 32: UpdateAuthority — market-level authority rotation (no kind field).
+    let data = Instruction::UpdateAuthority { new_pubkey }.encode();
     match Instruction::decode(&data).unwrap() {
         Instruction::UpdateAuthority {
+            new_pubkey: got_pubkey,
+        } => {
+            assert_eq!(got_pubkey, new_pubkey);
+        }
+        _ => unreachable!(),
+    }
+
+    // Tag 65: UpdateAssetAuthority — per-asset authority rotation (kind + asset_index).
+    let data65 = Instruction::UpdateAssetAuthority {
+        asset_index,
+        kind,
+        new_pubkey,
+    }
+    .encode();
+    match Instruction::decode(&data65).unwrap() {
+        Instruction::UpdateAssetAuthority {
+            asset_index: got_asset,
             kind: got_kind,
             new_pubkey: got_pubkey,
         } => {
+            assert_eq!(got_asset, asset_index);
             assert_eq!(got_kind, kind);
             assert_eq!(got_pubkey, new_pubkey);
         }
@@ -605,27 +628,17 @@ fn kani_v16_update_authority_decode_preserves_wire_fields() {
     }
 }
 
+// v17: UpdateInsurancePolicy (tag 33) was removed in the auth overhaul.
+// Replaced by a proof for SetLpVaultPaused (tag 79) — a v17 LP vault instruction.
 #[kani::proof]
-fn kani_v16_update_insurance_policy_decode_preserves_wire_fields() {
-    let max_bps: u16 = kani::any();
-    let deposits_only: u8 = kani::any();
-    let cooldown_slots: u64 = kani::any();
+fn kani_v16_set_lp_vault_paused_decode_preserves_wire_fields() {
+    let paused: u8 = kani::any();
 
-    let mut data = [0u8; 12];
-    data[0] = 33;
-    data[1..3].copy_from_slice(&max_bps.to_le_bytes());
-    data[3] = deposits_only;
-    data[4..12].copy_from_slice(&cooldown_slots.to_le_bytes());
+    let data = Instruction::SetLpVaultPaused { paused }.encode();
 
     match Instruction::decode(&data).unwrap() {
-        Instruction::UpdateInsurancePolicy {
-            max_bps: got_max_bps,
-            deposits_only: got_deposits_only,
-            cooldown_slots: got_cooldown,
-        } => {
-            assert_eq!(got_max_bps, max_bps);
-            assert_eq!(got_deposits_only, deposits_only);
-            assert_eq!(got_cooldown, cooldown_slots);
+        Instruction::SetLpVaultPaused { paused: got } => {
+            assert_eq!(got, paused);
         }
         _ => unreachable!(),
     }
@@ -665,15 +678,16 @@ fn kani_v16_update_maintenance_fee_policy_decode_preserves_wire_fields() {
 
 #[kani::proof]
 fn kani_v16_update_backing_fee_policy_decode_preserves_wire_fields() {
-    let domain: u8 = kani::any();
+    // v17: domain is u16. Wire: tag(1) + domain(u16=2) + fee_bps(u16=2) + insurance_share_bps(u16=2) = 7.
+    let domain: u16 = kani::any();
     let fee_bps: u16 = kani::any();
     let insurance_share_bps: u16 = kani::any();
 
-    let mut data = [0u8; 6];
+    let mut data = [0u8; 7];
     data[0] = 51;
-    data[1] = domain;
-    data[2..4].copy_from_slice(&fee_bps.to_le_bytes());
-    data[4..6].copy_from_slice(&insurance_share_bps.to_le_bytes());
+    data[1..3].copy_from_slice(&domain.to_le_bytes());
+    data[3..5].copy_from_slice(&fee_bps.to_le_bytes());
+    data[5..7].copy_from_slice(&insurance_share_bps.to_le_bytes());
 
     match Instruction::decode(&data).unwrap() {
         Instruction::UpdateBackingFeePolicy {
@@ -1033,7 +1047,14 @@ fn kani_v16_custody_payloads_reject_trailing_byte() {
         extra,
     );
     assert_rejects_trailing_byte(Instruction::WithdrawInsurance { amount: 1 }, extra);
-    assert_rejects_trailing_byte(Instruction::WithdrawInsuranceLimited { amount: 1 }, extra);
+    // v17: WithdrawInsuranceLimited removed; WithdrawInsuranceAsset replaces domain withdraw.
+    assert_rejects_trailing_byte(
+        Instruction::WithdrawInsuranceAsset {
+            asset_index: 0,
+            amount: 1,
+        },
+        extra,
+    );
     assert_rejects_trailing_byte(Instruction::SwapSecondaryForPrimary { amount: 1 }, extra);
 }
 
@@ -1080,21 +1101,23 @@ fn kani_v16_admin_policy_payloads_reject_trailing_byte() {
 
     assert_rejects_trailing_byte(Instruction::CloseSlab, extra);
     assert_rejects_trailing_byte(Instruction::ResolveMarket, extra);
+    // v17: UpdateAuthority no longer has `kind`; UpdateAssetAuthority (tag 65) handles per-asset.
     assert_rejects_trailing_byte(
         Instruction::UpdateAuthority {
-            kind: 0,
             new_pubkey: [1u8; 32],
         },
         extra,
     );
     assert_rejects_trailing_byte(
-        Instruction::UpdateInsurancePolicy {
-            max_bps: 10_000,
-            deposits_only: 1,
-            cooldown_slots: 1,
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 0,
+            new_pubkey: [1u8; 32],
         },
         extra,
     );
+    // v17: UpdateInsurancePolicy (tag 33) removed; SetLpVaultPaused (tag 79) added.
+    assert_rejects_trailing_byte(Instruction::SetLpVaultPaused { paused: 0 }, extra);
     assert_rejects_trailing_byte(
         Instruction::UpdateLiquidationFeePolicy {
             cranker_share_bps: 4_000,
@@ -1288,12 +1311,12 @@ fn kani_v16_unknown_or_truncated_tags_reject() {
     kani::assume(tag != 10);
     kani::assume(tag != 13);
     kani::assume(tag != 19);
-    kani::assume(tag != 23);
+    // v17: tag 23 (WithdrawInsuranceLimited) removed — decode([23]) returns Err, no assume needed.
     kani::assume(tag != 24);
     kani::assume(tag != 28);
     kani::assume(tag != 30);
     kani::assume(tag != 32);
-    kani::assume(tag != 33);
+    // v17: tag 33 (UpdateInsurancePolicy) removed — decode([33]) returns Err, no assume needed.
     kani::assume(tag != 34);
     kani::assume(tag != 35);
     kani::assume(tag != 36);
@@ -1316,6 +1339,10 @@ fn kani_v16_unknown_or_truncated_tags_reject() {
     kani::assume(tag != 53);
     kani::assume(tag != 54);
     kani::assume(tag != 55);
+    // v17 zero-payload instructions (decode succeeds from a single byte — must exclude):
+    kani::assume(tag != 77); // ExecuteRedemption
+    kani::assume(tag != 78); // LpVaultCrankFees
+    kani::assume(tag != 80); // CloseLpVault
     assert!(Instruction::decode(&[tag]).is_err());
 
     let deposit_tag_only = [3u8];
@@ -1360,9 +1387,12 @@ fn kani_v16_every_active_payload_rejects_one_byte_truncation() {
     let top_up_backing = [24u8; 25];
     assert!(Instruction::decode(&top_up_backing).is_err());
 
+    // v17: tag 23 (WithdrawInsuranceLimited) removed — 16-byte payload still fails (unknown tag).
     let withdraw_insurance = [23u8; 16];
     assert!(Instruction::decode(&withdraw_insurance).is_err());
 
+    // v17: tag 57 is WithdrawInsuranceAsset { asset_index: u16, amount: u128 } = 19 bytes.
+    // 17 bytes is one-byte-truncated → fails. (Was WithdrawInsuranceDomain, same truncation test.)
     let withdraw_insurance_domain = [57u8; 17];
     assert!(Instruction::decode(&withdraw_insurance_domain).is_err());
 
@@ -1372,9 +1402,12 @@ fn kani_v16_every_active_payload_rejects_one_byte_truncation() {
     let close_resolved = [30u8; 16];
     assert!(Instruction::decode(&close_resolved).is_err());
 
-    let update_authority = [32u8; 33];
+    // v17: UpdateAuthority { new_pubkey } = tag(1) + key(32) = 33 bytes total.
+    // Use 32 bytes (one-byte truncation) to guarantee decode fails.
+    let update_authority = [32u8; 32];
     assert!(Instruction::decode(&update_authority).is_err());
 
+    // v17: tag 33 (UpdateInsurancePolicy) removed — 11-byte payload still fails (unknown tag).
     let update_insurance = [33u8; 11];
     assert!(Instruction::decode(&update_insurance).is_err());
 
