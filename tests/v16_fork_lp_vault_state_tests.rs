@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! LP Vault data-layer unit tests (Phase 2.B Tier 3, Workstream 4B — Phase B).
 //!
 //! Covers the wrapper-side LP Vault account types + helpers added in the

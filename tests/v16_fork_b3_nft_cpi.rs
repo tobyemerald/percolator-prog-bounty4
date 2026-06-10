@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! B-3 TransferPortfolioOwnership + SetNftProgramId tests.
 //!
 //! Coverage:

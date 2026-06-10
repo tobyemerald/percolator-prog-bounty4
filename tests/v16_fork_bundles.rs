@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! Fork-bundle adversarial tests against the v16 baseline.
 //!
 //! Each `#[test]` here belongs to a specific Phase 2.B fork-feature bundle

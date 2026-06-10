@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! LP Vault crank + admin tests (Phase 2.B Tier 3, Workstream 4B — Phases F + G).
 //!
 //! F — LpVaultCrankFees (tag 78): no-new-fees reject (happy path needs bucket

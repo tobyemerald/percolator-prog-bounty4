@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! Phase 3A.0 — 5-program assembled cross-cut SMOKE (load feasibility + token
 //! coexistence). See `~/wrapper-engine-deep-audit/phase3a_crosscut_design.md`.
 //!

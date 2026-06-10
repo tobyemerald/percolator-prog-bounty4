@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! A.5 End-to-End NFT integration suite — Percolator Position-NFT ↔ wrapper B-3
 //! ownership-transfer flow.
 //!

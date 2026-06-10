@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! Workstream 1 (Phase 2.B Tier 3) — envelope-gate LiteSVM coverage.
 //!
 //! Re-ports the 2 init-time invariants tracked in the archived v12

@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! LP Vault CreateLpVault integration tests (Phase 2.B Tier 3, Workstream 4B — Phase C).
 //!
 //! LiteSVM black-box: loads the wrapper BPF + SPL Token BPF, initializes a

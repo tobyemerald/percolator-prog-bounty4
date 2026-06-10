@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! LP Vault redeem-flow integration tests (Phase 2.B Tier 3, Workstream 4B — Phase E).
 //!
 //! RequestRedeemLpShares (tag 76) + ExecuteRedemption (tag 77), B-7 cooldown.

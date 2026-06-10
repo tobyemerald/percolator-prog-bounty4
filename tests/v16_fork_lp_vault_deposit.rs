@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! LP Vault DepositToLpVault integration tests (Phase 2.B Tier 3, Workstream 4B — Phase D).
 //!
 //! LiteSVM black-box. Exercises DepositToLpVault (tag 75, Option A inline

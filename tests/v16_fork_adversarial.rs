@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! Phase 2.E — economic-adversarial re-port of the v12 attack-vector suite onto
 //! the v16 LiteSVM surface (Workstream 6, Tier 3 close-out).
 //!

@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 //! Phase 2.A.2 minimum-viable LiteSVM smoke harness.
 //!
 //! These tests are the documented commitment that the v16 wrapper baseline

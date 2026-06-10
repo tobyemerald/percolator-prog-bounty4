@@ -1,3 +1,5 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
 use percolator::{
     AssetLifecycleV16, AssetStateV16Account, BackingBucketStatusV16, CloseProgressLedgerV16,
     EngineAssetSlotV16Account, MarketGroupV16HeaderAccount, MarketModeV16,
